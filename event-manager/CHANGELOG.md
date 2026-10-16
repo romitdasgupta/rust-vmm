@@ -3,6 +3,11 @@
 ## Upcoming Version
 
 ### Changed
+
+ - The crate is Linux-only for now: it is empty on targets other than
+   `target_os = "linux"` or `"android"`, so workspaces that also build for
+   macOS keep compiling. A kqueue backend is planned.
+
 ### Added
 ### Fixed
 ### Removed

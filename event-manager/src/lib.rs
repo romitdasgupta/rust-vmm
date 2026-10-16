@@ -5,6 +5,7 @@
 #![deny(missing_debug_implementations)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};

@@ -1,21 +1,36 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 use criterion::{criterion_group, criterion_main, Criterion};
 
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 use event_manager::utilities::subscribers::{
     CounterInnerMutSubscriber, CounterSubscriber, CounterSubscriberWithData,
 };
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 use event_manager::{EventManager, EventSubscriber, MutEventSubscriber, SubscriberOps};
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 use std::sync::{Arc, Mutex};
 
 // Test the performance of event manager when it manages a single subscriber type.
 // The performance is assessed under stress, all added subscribers have active events.
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 fn run_basic_subscriber(c: &mut Criterion) {
     let no_of_subscribers = 200;
 
@@ -36,7 +51,10 @@ fn run_basic_subscriber(c: &mut Criterion) {
 
 // Test the performance of event manager when the subscribers are wrapped in an Arc<Mutex>.
 // The performance is assessed under stress, all added subscribers have active events.
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 fn run_arc_mutex_subscriber(c: &mut Criterion) {
     let no_of_subscribers = 200;
 
@@ -58,7 +76,10 @@ fn run_arc_mutex_subscriber(c: &mut Criterion) {
 // Test the performance of event manager when the subscribers are wrapped in an Arc, and they
 // leverage inner mutability to update their internal state.
 // The performance is assessed under stress, all added subscribers have active events.
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 fn run_subscriber_with_inner_mut(c: &mut Criterion) {
     let no_of_subscribers = 200;
 
@@ -82,7 +103,10 @@ fn run_subscriber_with_inner_mut(c: &mut Criterion) {
 // (using CounterSubscriberWithData).
 // The performance is assessed under stress, all added subscribers have active events, and the
 // CounterSubscriberWithData subscribers have multiple active events.
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 fn run_multiple_subscriber_types(c: &mut Criterion) {
     let no_of_subscribers = 100;
 
@@ -110,7 +134,10 @@ fn run_multiple_subscriber_types(c: &mut Criterion) {
 
 // Test the performance of event manager when it manages a single subscriber type.
 // Just a few of the events are active in this test scenario.
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 fn run_with_few_active_events(c: &mut Criterion) {
     let no_of_subscribers = 200;
 
@@ -133,7 +160,10 @@ fn run_with_few_active_events(c: &mut Criterion) {
     });
 }
 
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -143,10 +173,16 @@ criterion_group! {
               run_multiple_subscriber_types, run_with_few_active_events
 }
 
-#[cfg(feature = "test_utilities")]
+#[cfg(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+))]
 criterion_main! {
     benches
 }
 
-#[cfg(not(feature = "test_utilities"))]
+#[cfg(not(all(
+    feature = "test_utilities",
+    any(target_os = "linux", target_os = "android")
+)))]
 fn main() {}
