@@ -8,7 +8,6 @@ use std::sync::OnceLock;
 use hvf_bindings::DynApi;
 
 /// The process-wide table of run-time resolved framework functions.
-#[allow(dead_code)]
 pub(crate) fn api() -> &'static DynApi {
     static API: OnceLock<DynApi> = OnceLock::new();
     API.get_or_init(DynApi::load)
@@ -23,7 +22,6 @@ pub(crate) fn api() -> &'static DynApi {
 /// // SAFETY: ...
 /// let config = unsafe { create() };
 /// ```
-#[allow(unused_macros)]
 macro_rules! need {
     ($name:ident) => {
         match $crate::avail::api().$name {
