@@ -168,7 +168,9 @@ pub(crate) mod tests {
     // The `step` parameter represents the offset that's added the the current address after
     // performing each access. It provides finer grained control when testing tracking
     // implementations that aggregate entire ranges for accounting purposes (for example, doing
-    // tracking at the page level).
+    // tracking at the page level). The first access happens at offset `step`, so `bytes` must
+    // be at least `4 * step + 1024` bytes long, and the range below `step` is free to have been
+    // dirtied by the caller beforehand.
     pub fn test_bytes<F, G, M, A>(bytes: &M, check_range_fn: F, address_fn: G, step: usize)
     where
         F: Fn(&M, usize, usize, bool) -> bool,
@@ -178,7 +180,7 @@ pub(crate) mod tests {
     {
         const BUF_SIZE: usize = 1024;
         let buf = vec![1u8; 1024];
-        let mut dirty_offset = 0x1000;
+        let mut dirty_offset = step;
 
         let val = 1u64;
 
@@ -241,15 +243,15 @@ pub(crate) mod tests {
         assert!(range_is_dirty(slice.bitmap(), 0, dirty_len));
 
         // Finally, let's invoke the generic tests for `R: Bytes`. It's ok to pass the same
-        // `region` handle because `test_bytes` starts performing writes after the range that's
-        // been already dirtied in the first part of this test.
+        // `region` handle because `test_bytes` starts performing writes one page after the range
+        // that's been already dirtied in the first part of this test.
         test_bytes(
             region,
             |r: &R, start: usize, len: usize, clean: bool| {
                 check_range(&r.bitmap(), start, len, clean)
             },
             |offset| MemoryRegionAddress(offset as u64),
-            0x1000,
+            crate::page_size(),
         );
     }
 
@@ -260,8 +262,9 @@ pub(crate) mod tests {
         M: GuestMemoryBackend,
         F: Fn() -> M,
     {
+        let page_size = crate::page_size();
         let m = f();
-        let dirty_addr = GuestAddress(0x1000);
+        let dirty_addr = GuestAddress(page_size as u64);
         let val = 123u64;
         let dirty_len = size_of_val(&val);
 
@@ -298,19 +301,22 @@ pub(crate) mod tests {
             &f(),
             check_range_closure,
             |offset| GuestAddress(offset as u64),
-            0x1000,
+            page_size,
         );
     }
 
+    // Tests a `VolatileMemory` implementation whose bitmap tracks at a granularity no coarser
+    // than the host page size. It assumes `m` covers at least 4 host pages.
     pub fn test_volatile_memory<M: VolatileMemory>(m: &M) {
-        assert!(m.len() >= 0x8000);
+        let page_size = crate::page_size();
+        assert!(m.len() >= 4 * page_size);
 
-        let dirty_offset = 0x1000;
+        let dirty_offset = page_size;
         let val = 123u64;
         let dirty_len = size_of_val(&val);
 
-        let get_ref_offset = 0x2000;
-        let array_ref_offset = 0x3000;
+        let get_ref_offset = 2 * page_size;
+        let array_ref_offset = 3 * page_size;
 
         let s1 = m.as_volatile_slice();
         let s2 = m.get_slice(dirty_offset, dirty_len).unwrap();

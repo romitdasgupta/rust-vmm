@@ -28,8 +28,8 @@ compile_error!("vm-memory only supports 64-bit targets!");
 #[cfg(all(target_family = "windows", feature = "rawfd"))]
 compile_error!("rawfd feature is not supported on Windows targets!");
 
-#[cfg(all(target_family = "windows", feature = "xen"))]
-compile_error!("xen feature is not supported on Windows targets!");
+#[cfg(all(not(target_os = "linux"), feature = "xen"))]
+compile_error!("xen feature is only supported on Linux targets!");
 
 #[macro_use]
 pub mod address;
@@ -75,6 +75,29 @@ pub mod mmap;
 
 #[cfg(feature = "backend-mmap")]
 pub use mmap::{GuestMemoryMmap, GuestRegionMmap, MmapRegion};
+
+/// Returns the host page size, for tests whose offsets and sizes must be page aligned.
+///
+/// Hard-coding `0x1000` breaks on hosts with larger pages, such as the 16 KiB pages used by
+/// macOS on Apple Silicon.
+#[cfg(all(test, any(feature = "backend-bitmap", feature = "backend-mmap")))]
+pub(crate) fn page_size() -> usize {
+    #[cfg(target_family = "unix")]
+    // SAFETY: `sysconf` has no memory safety preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+
+    #[cfg(target_family = "windows")]
+    let page_size = {
+        use winapi::um::sysinfoapi::GetSystemInfo;
+        let mut sysinfo = std::mem::MaybeUninit::zeroed();
+        // SAFETY: `sysinfo` is correctly sized, writable memory for a `SYSTEM_INFO`.
+        unsafe { GetSystemInfo(sysinfo.as_mut_ptr()) };
+        // SAFETY: `GetSystemInfo` always initializes `sysinfo`.
+        unsafe { sysinfo.assume_init().dwPageSize }
+    };
+
+    usize::try_from(page_size).expect("host page size must fit in usize")
+}
 #[cfg(all(feature = "backend-mmap", feature = "xen", target_family = "unix"))]
 pub use mmap::{MmapRange, MmapXenFlags};
 
