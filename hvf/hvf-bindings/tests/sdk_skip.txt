@@ -1,0 +1,14 @@
+# Items of the arm64 Hypervisor.framework headers that hvf-bindings
+# deliberately does not bind, one function or constant name per line.
+# `tests/sdk_check.rs` fails if the SDK has an item that is neither bound nor
+# listed here, and if an item listed here is no longer in the SDK.
+#
+# hv_vcpu_set_simd_fp_reg is bound through a trampoline
+# (hv_vcpu_set_simd_fp_reg_by_ref) and checked separately, so it is not
+# listed.
+#
+# The structures hv_data_abort_notification_t and hv_vm_mem_access_msg_t of
+# hv_kern_types.h are not used by any public function and are not bound
+# either; this file only lists functions and constants.
+#
+# Every function and constant of SDK 27.0 is bound.

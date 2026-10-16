@@ -201,7 +201,10 @@ pub struct hv_simd_fp_uchar16_t(pub [u8; 16]);
 
 /// The 512-bit SME `ZT0` register value (`ext_vector_type(64) uint8_t`),
 /// only ever passed by pointer.
-#[repr(C, align(64))]
+///
+/// Like the C type, it is 64 bytes long but only 16-byte aligned (the
+/// largest vector alignment of AAPCS64).
+#[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct hv_sme_zt0_uchar64_t(pub [u8; 64]);
 
