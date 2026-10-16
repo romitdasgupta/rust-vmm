@@ -31,3 +31,16 @@ libc = "0.2.39"
 [dev-dependencies]
 vm-device = { path = "../../vm-device" }
 vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+# Used by the `boot_linux` example and its test, which only build there.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+linux-loader = { path = "../../linux-loader" }
+vm-fdt = "0.3.0"
+
+[[example]]
+name = "boot_linux"
+# `Vm::map_guest_memory` maps the vm-memory guest RAM.
+required-features = ["vm-memory"]
+# Run the unit tests of the example (argument parsing, device models) with
+# `cargo test`; they do not need Hypervisor.framework.
+test = true
