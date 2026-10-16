@@ -48,7 +48,7 @@
 //! The guest below performs a few MMIO accesses to an unmapped region, issues
 //! an `hvc #0`, and then waits for an interrupt with `wfi`.
 //!
-//! ```no_run
+//! ```
 //! # #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use hvf::{ExceptionClass, Hvf, MemoryFlags, Reg, VcpuExit, VmConfig};
