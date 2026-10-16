@@ -13,8 +13,10 @@
 //!
 //! - The GIC must be created before the first vCPU. [`Vm::create_gic`]
 //!   enforces this, and that at most one GIC exists.
-//! - Set `MPIDR_EL1` of each vCPU before its redistributor is used: the
-//!   framework assigns redistributors by affinity.
+//! - Set `MPIDR_EL1` of each vCPU before its redistributor is used. The
+//!   framework hands out the redistributor frames in vCPU id order, whatever
+//!   the affinity; each frame's `GICR_TYPER` reports the affinity, which is
+//!   how a guest finds its frame.
 //! - [`Gic::save_state`] is only meaningful while no vCPU runs, and
 //!   [`Gic::restore_state`] must happen after every vCPU is created and before
 //!   the first run. The crate does not track running vCPUs, so it leaves these
@@ -283,9 +285,9 @@ impl Vcpu {
     /// The guest physical base address of this vCPU's redistributor
     /// (`hv_gic_get_redistributor_base`, macOS 15.0).
     ///
-    /// The framework derives it from `MPIDR_EL1`, so set that first: the
-    /// redistributor of the vCPU with `Aff0 = n` is at
-    /// `redistributor_base + n * redistributor_size`.
+    /// Set `MPIDR_EL1` first. The frame goes by vCPU id, not by affinity:
+    /// the vCPU with id `n` gets `redistributor_base + n * redistributor_size`,
+    /// and that frame's `GICR_TYPER` reports the vCPU's `MPIDR_EL1` affinity.
     pub fn gic_redistributor_base(&self) -> Result<u64> {
         let f = need!(hv_gic_get_redistributor_base);
         // SAFETY: owning thread, live vCPU, pointer valid for a `hv_ipa_t`.

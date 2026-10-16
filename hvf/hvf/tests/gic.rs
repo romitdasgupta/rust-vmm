@@ -281,19 +281,28 @@ fn test_redistributor_base() {
     };
     let (vm, _gic) = vm_with_gic();
 
-    let vcpu0 = vcpu_with_aff0(&vm, 0);
+    // The frames go by vCPU id, not by affinity: vCPU 0 has Aff0 = 1 and
+    // still gets the first frame. GICR_TYPER[63:32] reports the affinity.
+    let vcpu0 = vcpu_with_aff0(&vm, 1);
+    assert_eq!(vcpu0.id(), 0);
     assert_eq!(vcpu0.gic_redistributor_base().unwrap(), REDIST_BASE);
+    assert_eq!(vcpu0.gic_redistributor_reg(0x8).unwrap() >> 32, 1);
 
-    // vCPUs are bound to their thread; the second one gets the next
-    // redistributor by its affinity.
+    // vCPUs are bound to their thread; the second one gets the next frame.
     let vm1 = vm.clone();
-    let base1 = thread::spawn(move || {
-        let vcpu1 = vcpu_with_aff0(&vm1, 1);
-        vcpu1.gic_redistributor_base().unwrap()
+    let (id1, base1, typer1) = thread::spawn(move || {
+        let vcpu1 = vcpu_with_aff0(&vm1, 0);
+        (
+            vcpu1.id(),
+            vcpu1.gic_redistributor_base().unwrap(),
+            vcpu1.gic_redistributor_reg(0x8).unwrap(),
+        )
     })
     .join()
     .unwrap();
+    assert_eq!(id1, 1);
     assert_eq!(base1, REDIST_BASE + params.redistributor_size);
+    assert_eq!(typer1 >> 32, 0);
     assert_eq!(params.redistributor_size, 0x20000);
 }
 

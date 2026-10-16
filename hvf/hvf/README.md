@@ -329,8 +329,10 @@ called (alignment, IPA range, overlap, MSI range inside the SPI range).
 - **Create order.** Create the GIC before the first vCPU. Afterwards,
   `create_gic` returns `Error::GicAfterVcpu`.
 - **Redistributors.** Set each vCPU's `MPIDR_EL1` before using its
-  redistributor. Redistributors are assigned by affinity:
-  `Vcpu::gic_redistributor_base()` is `redistributor_base + Aff0 * size`.
+  redistributor. Redistributors are assigned in vCPU id order, whatever the
+  affinity: `Vcpu::gic_redistributor_base()` is
+  `redistributor_base + id * size`, and the frame's `GICR_TYPER` reports the
+  vCPU's affinity.
 - **Interrupt lines.** `Gic::set_spi` and `Gic::send_msi` work from any
   thread. For `send_msi`, the doorbell address is normally `msi.base + 0x40`.
   SPIs outside the SPI range, or inside the MSI range, fail with
