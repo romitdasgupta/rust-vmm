@@ -53,6 +53,9 @@ pub const DEFAULT_CMDLINE: &str = "console=ttyAMA0 earlycon=pl011,mmio32,0x90000
 /// The longest command line arm64 Linux accepts, including the NUL.
 const COMMAND_LINE_SIZE: usize = 2048;
 
+/// How long the VMM waits for the console output to drain when it stops.
+const CONSOLE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The arm64 Image magic, `"ARM\x64"` at offset 0x38.
 const ARM64_IMAGE_MAGIC: &[u8; 4] = b"ARM\x64";
 
@@ -287,7 +290,8 @@ fn spawn_input(machine: Weak<Machine>, mut input: Box<dyn Read + Send>) -> Resul
                         escape = false;
                         match b {
                             b'x' | b'X' => {
-                                machine.console.receive(&bytes);
+                                // Not through the UART, so a guest or an
+                                // output that is stuck cannot delay it.
                                 machine.shutdown(Outcome::Quit);
                                 return;
                             }
@@ -398,14 +402,14 @@ pub fn run(cfg: Config) -> Result<Outcome> {
     })?);
     let uart_intid = params.spi_base + UART_SPI;
     let irq_log = log;
-    let console = Arc::new(Pl011::new(
+    let console = Pl011::new(
         cfg.output,
         Box::new(move |level| {
             if let Err(e) = gic.set_spi(uart_intid, level) {
                 irq_log.print(format_args!("cannot set SPI {uart_intid}: {e}"));
             }
         }),
-    ));
+    )?;
     let mut bus = MmioBus::new();
     bus.register(
         BusRange::new(MmioAddress(UART_BASE), UART_SIZE)?,
@@ -450,6 +454,13 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         .take()
         .unwrap_or_else(|| Err("every vCPU stopped".into()));
     machine.debug(format_args!("guest stopped: {outcome:?}"));
+    // The last console lines (`reboot: Power down`) may still be queued.
+    // Give up on them if the output is blocked, so that Ctrl-A x works.
+    if !machine.console.flush(CONSOLE_FLUSH_TIMEOUT) {
+        log.print(format_args!(
+            "the console output is blocked; dropping what the guest wrote last"
+        ));
+    }
 
     // Every vCPU is gone; remove the RAM from the guest before freeing it.
     machine.vm.unmap(RAM_BASE, usize::try_from(cfg.mem_size)?)?;

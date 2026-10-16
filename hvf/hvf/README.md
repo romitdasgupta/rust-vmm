@@ -73,7 +73,7 @@ The VMM puts these pieces together:
 | Kernel | `linux-loader`'s `PE` loader for the arm64 `Image`. The initrd follows the kernel's `image_size`, and the DTB sits in the last 2 MiB of RAM |
 | Device tree | `vm-fdt`: CPUs, memory, `/chosen` (command line, initrd, RNG seed), PSCI, GICv3, the architected timer and the PL011 |
 | Interrupts and timer | the in-kernel GICv3 (`Vm::create_gic`) at QEMU `virt` addresses: distributor `0x0800_0000`, redistributors `0x080a_0000` |
-| Console | an emulated PL011 at `0x0900_0000` on a `vm-device` MMIO bus. It writes to stdout and reads from stdin (raw mode on a terminal), raising SPI 1 with `Gic::set_spi` |
+| Console | an emulated PL011 at `0x0900_0000` on a `vm-device` MMIO bus. It reads from stdin (raw mode on a terminal) and writes to stdout from its own thread, through a 64 KiB queue, so a blocked stdout never stalls a vCPU or `Ctrl-A x`. It raises SPI 1 with `Gic::set_spi` |
 | SMP and power | PSCI 1.0 over `HVC`: `CPU_ON`, `CPU_OFF` and `AFFINITY_INFO` with one thread per vCPU, and `SYSTEM_OFF`/`SYSTEM_RESET` to stop the VMM |
 | Traps | the OS lock and DCC registers Linux touches. Everything else is RAZ/WI |
 
