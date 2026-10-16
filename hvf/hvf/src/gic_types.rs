@@ -3,6 +3,8 @@
 
 //! Plain data describing the in-kernel GICv3 (macOS 15.0).
 
+use hvf_bindings as hv;
+
 /// Guest physical layout of the in-kernel GICv3.
 ///
 /// All addresses must satisfy the alignment reported by `Hvf::gic_params`.
@@ -70,4 +72,42 @@ pub enum GicIntid {
     El1VirtualTimer,
     /// EL1 physical timer interrupt.
     El1PhysicalTimer,
+}
+
+impl GicIntid {
+    /// The corresponding `hv_gic_intid_t` value.
+    // Only used by the macOS/aarch64 modules.
+    #[allow(dead_code)]
+    pub(crate) fn raw(self) -> hv::hv_gic_intid_t {
+        match self {
+            GicIntid::PerformanceMonitor => hv::HV_GIC_INT_PERFORMANCE_MONITOR,
+            GicIntid::Maintenance => hv::HV_GIC_INT_MAINTENANCE,
+            GicIntid::El2PhysicalTimer => hv::HV_GIC_INT_EL2_PHYSICAL_TIMER,
+            GicIntid::El1VirtualTimer => hv::HV_GIC_INT_EL1_VIRTUAL_TIMER,
+            GicIntid::El1PhysicalTimer => hv::HV_GIC_INT_EL1_PHYSICAL_TIMER,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gic_intid_raw() {
+        assert_eq!(GicIntid::PerformanceMonitor.raw(), 23);
+        assert_eq!(GicIntid::Maintenance.raw(), 25);
+        assert_eq!(GicIntid::El2PhysicalTimer.raw(), 26);
+        assert_eq!(GicIntid::El1VirtualTimer.raw(), 27);
+        assert_eq!(GicIntid::El1PhysicalTimer.raw(), 30);
+    }
+
+    #[test]
+    fn test_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<GicConfig>();
+        assert_send_sync::<MsiConfig>();
+        assert_send_sync::<GicParams>();
+        assert_send_sync::<GicIntid>();
+    }
 }
