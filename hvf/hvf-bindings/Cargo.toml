@@ -1,0 +1,19 @@
+[package]
+name = "hvf-bindings"
+version = "0.1.0"
+authors = ["The rust-vmm authors"]
+description = "Rust FFI bindings to the macOS Hypervisor.framework (Apple silicon)"
+repository.workspace = true
+readme = "README.md"
+keywords = ["hvf", "hypervisor", "macos", "virtualization", "ffi"]
+categories = ["external-ffi-bindings", "os::macos-apis", "virtualization"]
+license = "Apache-2.0 OR BSD-3-Clause"
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+all-features = true
+
+[dependencies]

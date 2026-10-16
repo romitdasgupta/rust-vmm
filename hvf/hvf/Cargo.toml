@@ -1,0 +1,33 @@
+[package]
+name = "hvf"
+version = "0.1.0"
+authors = ["The rust-vmm authors"]
+description = "Safe wrappers over the macOS Hypervisor.framework (Apple silicon)"
+repository.workspace = true
+readme = "README.md"
+keywords = ["hvf", "hypervisor", "macos", "virtualization"]
+categories = ["os::macos-apis", "virtualization"]
+license = "Apache-2.0 OR BSD-3-Clause"
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+all-features = true
+
+[features]
+# Adds `Vm::map_guest_memory` for mapping a `vm_memory::GuestMemory` into the VM.
+vm-memory = ["dep:vm-memory"]
+
+[dependencies]
+bitflags = "2"
+hvf-bindings = { workspace = true }
+vm-memory = { workspace = true, optional = true, features = ["backend-mmap"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.39"
+
+[dev-dependencies]
+vm-device = { path = "../../vm-device" }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
