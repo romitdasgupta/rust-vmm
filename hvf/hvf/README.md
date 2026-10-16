@@ -55,6 +55,52 @@ The crate documentation has a complete, runnable version of this example, and
 cargo run -p hvf --example mmio_guest
 ```
 
+## Booting Linux
+
+[`examples/boot_linux`](examples/boot_linux) is a small VMM that boots an
+arm64 Linux kernel to userspace (macOS 15.0 or newer):
+
+```sh
+cargo run --release -p hvf --features vm-memory --example boot_linux -- \
+    --kernel Image --initrd initramfs.cpio.gz --cpus 4 --mem 512M
+```
+
+The VMM puts these pieces together:
+
+| Piece | How |
+|---|---|
+| RAM | `vm-memory` `GuestMemoryMmap` at `0x8000_0000`, mapped with `Vm::map_guest_memory` |
+| Kernel | `linux-loader`'s `PE` loader for the arm64 `Image`. The initrd follows the kernel's `image_size`, and the DTB sits in the last 2 MiB of RAM |
+| Device tree | `vm-fdt`: CPUs, memory, `/chosen` (command line, initrd, RNG seed), PSCI, GICv3, the architected timer and the PL011 |
+| Interrupts and timer | the in-kernel GICv3 (`Vm::create_gic`) at QEMU `virt` addresses: distributor `0x0800_0000`, redistributors `0x080a_0000` |
+| Console | an emulated PL011 at `0x0900_0000` on a `vm-device` MMIO bus. It writes to stdout and reads from stdin (raw mode on a terminal), raising SPI 1 with `Gic::set_spi` |
+| SMP and power | PSCI 1.0 over `HVC`: `CPU_ON`, `CPU_OFF` and `AFFINITY_INFO` with one thread per vCPU, and `SYSTEM_OFF`/`SYSTEM_RESET` to stop the VMM |
+| Traps | the OS lock and DCC registers Linux touches. Everything else is RAZ/WI |
+
+- **Kernel.** The kernel must be an uncompressed `Image`, not `Image.gz`
+  or an EFI zboot `vmlinuz`. It needs `CONFIG_SERIAL_AMBA_PL011_CONSOLE`,
+  `CONFIG_ARM_GIC_V3`, `CONFIG_ARM_ARCH_TIMER` and `CONFIG_ARM_PSCI_FW`, which
+  arm64 `defconfig` and Debian's `cloud-arm64` kernel have. Kernels without a
+  PL011 driver (Firecracker's CI kernels, for example) boot and power off,
+  but print nothing.
+- **Command line.** The default is `console=ttyAMA0
+  earlycon=pl011,mmio32,0x9000000 panic=-1`.
+- **Exit status.** The VMM exits with 0 when the guest powers off, 3 when
+  it resets (for example after a panic with `panic=-1`), 130 after
+  `Ctrl-A x` and 1 on errors. `--verbose` logs the memory layout, the PSCI
+  calls and the vCPU power state changes.
+
+No kernel or initramfs is included in this repository. An initramfs whose
+`/init` prints `HVF-BOOT-OK` and then powers off, for example with
+`reboot(LINUX_REBOOT_CMD_POWER_OFF)` or `poweroff -f`, can be checked with the
+ignored test in [`tests/boot_linux.rs`](tests/boot_linux.rs). The test boots
+with 1 and 4 vCPUs. Without the variables it prints `SKIP` and passes:
+
+```sh
+HVF_LINUX_KERNEL=Image HVF_LINUX_INITRD=initramfs.cpio.gz \
+    cargo test -p hvf --features vm-memory --test boot_linux -- --ignored
+```
+
 ## Supported platforms
 
 - **`aarch64-apple-darwin`, macOS 11.0 or newer.** Only functions available
@@ -226,9 +272,16 @@ arithmetic without a vCPU.
 
 ### WFI and WFE
 
-The framework exits on `wfi`/`wfe` and does not wait itself. The usual
-pattern is to read `CNTV_CTL_EL0` and `CNTV_CVAL_EL0`, sleep until the timer
-deadline or a kick, then `advance_pc` and run again.
+Without the in-kernel GIC, the framework exits on `wfi` and does not wait
+itself. The usual pattern is to read `CNTV_CTL_EL0` and `CNTV_CVAL_EL0`,
+sleep until the timer deadline or a kick, then `advance_pc` and run again.
+
+With the in-kernel GIC (`Vm::create_gic`), `wfi` does not exit. `run`
+blocks in the framework until an interrupt is pending for the vCPU (a timer,
+an SPI from `Gic::set_spi` on any thread, or an SGI from another vCPU) and
+returns `Canceled` on a kick, with the PC already past the `wfi`.
+
+On macOS 27, `wfe` does not exit in either case.
 
 ## Interrupts without the in-kernel GIC
 
