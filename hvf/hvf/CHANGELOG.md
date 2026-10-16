@@ -23,3 +23,7 @@
   running release lacks one, the method returns `Error::Unavailable`.
 - Errors, register identifiers, exit decoding and MMIO arithmetic build on
   every target.
+- Example `boot_linux`: boots an arm64 Linux `Image` to userspace on the
+  in-kernel GICv3. It uses a PL011 console, PSCI SMP and power off, and
+  `vm-memory`, `linux-loader`, `vm-device` and `vm-fdt`. An ignored test
+  boots a kernel named by `HVF_LINUX_KERNEL` and `HVF_LINUX_INITRD`.
