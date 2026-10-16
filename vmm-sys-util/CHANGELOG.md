@@ -12,6 +12,14 @@
   `linux::aio::IoContext::submit` as unsafe to reflect that callers must uphold
   the safety requirements for submitted buffers.
 
+### Fixed
+
+- `rand::timestamp_cycles` uses `CLOCK_UPTIME_RAW` on Apple targets, where
+  `CLOCK_MONOTONIC` only has microsecond resolution. Its documentation now
+  states that consecutive calls may return the same value.
+- Fixed `rand`, `tempdir` and `metric` unit tests on macOS (coarse clock
+  resolution, symlinked temporary directories) and a Rust 1.99 clippy lint.
+
 ## v0.15.0
 
 ### Added

@@ -15,6 +15,11 @@ use std::str;
 ///
 /// The number retrieved will be based upon the time of the last reboot (x86_64)
 /// and something undefined for other architectures.
+///
+/// The value is monotonically non-decreasing, but two consecutive calls may
+/// return the same value when the underlying clock has a coarser resolution
+/// than the time between the calls (e.g. the 24 MHz system counter on Apple
+/// Silicon).
 pub fn timestamp_cycles() -> u64 {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Safe because there's nothing that can go wrong with this call.
@@ -30,9 +35,17 @@ pub fn timestamp_cycles() -> u64 {
             tv_sec: 0,
             tv_nsec: 0,
         };
+        // `CLOCK_MONOTONIC` only has microsecond resolution on Apple platforms,
+        // while `CLOCK_UPTIME_RAW` is backed by the system counter
+        // (`mach_absolute_time`) and has nanosecond granularity.
+        #[cfg(target_vendor = "apple")]
+        const CLOCK_ID: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+        #[cfg(not(target_vendor = "apple"))]
+        const CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
         // SAFETY: We initialized the parameters correctly and we trust the function.
         unsafe {
-            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+            libc::clock_gettime(CLOCK_ID, &mut ts);
         }
         (ts.tv_sec as u64) * MONOTONIC_CLOCK_MULTPIPLIER + (ts.tv_nsec as u64)
     }
@@ -110,15 +123,35 @@ mod tests {
 
     #[test]
     fn test_timestamp_cycles() {
+        // The timestamp never goes backwards.
         for _ in 0..1000 {
-            assert!(timestamp_cycles() < timestamp_cycles());
+            let a = timestamp_cycles();
+            let b = timestamp_cycles();
+            assert!(a <= b);
+        }
+
+        // The clock may be coarser than the time between two calls, but it
+        // must strictly advance within a bounded number of iterations.
+        let start = timestamp_cycles();
+        assert!((0..1_000_000).any(|_| timestamp_cycles() > start));
+    }
+
+    // Spins until `timestamp_cycles()` returns a value different from `prev`.
+    fn wait_for_next_timestamp(prev: u64) {
+        while timestamp_cycles() == prev {
+            std::hint::spin_loop();
         }
     }
 
     #[test]
     fn test_xor_pseudo_rng_u32() {
         for _ in 0..1000 {
-            assert_ne!(xor_pseudo_rng_u32(), xor_pseudo_rng_u32());
+            let a = xor_pseudo_rng_u32();
+            // `xor_pseudo_rng_u32` is a pure function of the timestamp, so make
+            // sure the timestamp moved before drawing the second number.
+            wait_for_next_timestamp(timestamp_cycles());
+            let b = xor_pseudo_rng_u32();
+            assert_ne!(a, b);
         }
     }
 
