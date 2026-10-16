@@ -143,7 +143,9 @@ mod tests {
         let path = t.as_path();
         assert!(path.exists());
         assert!(path.is_dir());
-        assert!(path.starts_with(temp_dir()));
+        // `temp_dir()` may contain symlinks (e.g. `/var` -> `/private/var` on
+        // macOS) while the created path is canonical.
+        assert!(path.starts_with(temp_dir().canonicalize().unwrap()));
     }
 
     #[test]
@@ -180,17 +182,22 @@ mod tests {
 
     #[test]
     fn test_create_dir_in() {
-        let t = TempDir::new_in(Path::new("/tmp")).unwrap();
-        let path = t.as_path();
-        assert!(path.exists());
-        assert!(path.is_dir());
-        assert!(path.starts_with("/tmp/"));
+        // `/tmp` may be a symlink (e.g. to `/private/tmp` on macOS) while the
+        // created path is canonical.
+        let tmp = Path::new("/tmp").canonicalize().unwrap();
 
         let t = TempDir::new_in(Path::new("/tmp")).unwrap();
         let path = t.as_path();
         assert!(path.exists());
         assert!(path.is_dir());
-        assert!(path.starts_with("/tmp"));
+        assert!(path.starts_with(&tmp));
+        assert_ne!(path, tmp);
+
+        let t = TempDir::new_in(Path::new("/tmp")).unwrap();
+        let path = t.as_path();
+        assert!(path.exists());
+        assert!(path.is_dir());
+        assert!(path.starts_with(&tmp));
     }
 
     #[test]
