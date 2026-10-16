@@ -6,6 +6,7 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
+#![cfg(any(target_os = "linux", target_os = "android"))]
 #![deny(missing_docs)]
 #![deny(missing_copy_implementations)]
 #![deny(missing_debug_implementations)]
@@ -54,7 +55,7 @@
 //!    [exit reasons](enum.VcpuExit.html).
 //!
 //!
-//! ```rust
+//! ```rust,ignore-apple
 //! use kvm_ioctls::VcpuExit;
 //! use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 //!
