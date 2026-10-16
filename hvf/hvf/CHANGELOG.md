@@ -4,5 +4,22 @@
 
 ### Added
 
-- Initial release: safe wrappers over the arm64 Hypervisor.framework API
-  (VM, memory, vCPU, exits, in-kernel GICv3).
+- Initial release: safe wrappers over the arm64 Hypervisor.framework API.
+  - `Hvf`: host probes and creation of the per-process `Vm`.
+  - `Vm`: map, unmap and protect guest memory with granule and IPA range
+    checks, and create vCPUs.
+  - `Vcpu` (bound to its thread) and `VcpuKicker`: run, registers, SIMD/FP
+    registers, IRQ/FIQ lines, virtual timer, debug traps, SError and TLB
+    invalidation, and MMIO completion helpers.
+  - `VcpuExit` and `ExceptionClass`: decoding of exits and exception
+    syndromes, including MMIO data aborts.
+  - `Gic`: the in-kernel GICv3 (macOS 15.0), with distributor,
+    redistributor, CPU interface and MSI registers, plus state save and
+    restore.
+  - `VmConfig`: IPA size, EL2 and 4 KiB stage-2 granule selection.
+  - Feature `vm-memory`: `Vm::map_guest_memory` for any
+    `vm_memory::GuestMemoryBackend`.
+- Functions newer than macOS 11.0 are resolved at run time. Where the
+  running release lacks one, the method returns `Error::Unavailable`.
+- Errors, register identifiers, exit decoding and MMIO arithmetic build on
+  every target.
