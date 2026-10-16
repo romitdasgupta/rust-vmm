@@ -574,10 +574,11 @@ mod tests {
     #[test]
     #[cfg(target_family = "unix")]
     fn test_retrieve_offset_from_fd_backing_memory_region() {
+        let page_size = crate::page_size();
         let f = TempFile::new().unwrap().into_file();
-        f.set_len(0x1400).unwrap();
-        // Needs to be aligned on 4k, otherwise mmap will fail.
-        let offset = 0x1000;
+        f.set_len(page_size as u64 + 0x400).unwrap();
+        // Needs to be aligned on the host page size, otherwise mmap will fail.
+        let offset = page_size as u64;
 
         let start_addr = GuestAddress(0x0);
         let gm = GuestMemoryMmap::from_ranges(&[(start_addr, 0x400)]).unwrap();
@@ -753,8 +754,12 @@ mod tests {
     #[cfg(feature = "backend-bitmap")]
     fn test_dirty_tracking() {
         crate::bitmap::tests::test_guest_memory_and_region(|| {
-            crate::GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x1_0000)])
-                .unwrap()
+            // `test_bytes` touches up to 4 pages past the first one, so map 8 pages.
+            crate::GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(
+                GuestAddress(0),
+                8 * crate::page_size(),
+            )])
+            .unwrap()
         });
     }
 

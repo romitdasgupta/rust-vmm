@@ -543,7 +543,9 @@ mod tests {
 
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE;
-        let offset = 4096;
+        let page_size = crate::page_size();
+        // Needs to be aligned on the host page size, otherwise mmap will fail.
+        let offset = page_size as u64;
         let size = 1000;
 
         // Offset + size will overflow.
@@ -564,8 +566,11 @@ mod tests {
         );
         assert_matches!(r.unwrap_err(), Error::MapFixed);
 
-        // Let's resize the file.
-        assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);
+        // Let's resize the file so that it covers `offset + size`.
+        assert_eq!(
+            unsafe { libc::ftruncate(a.as_raw_fd(), 2 * page_size as libc::off_t) },
+            0
+        );
 
         // The offset is not properly aligned.
         let r = MmapRegion::build(
@@ -587,7 +592,8 @@ mod tests {
         assert!(r.owned());
 
         let region_size = 0x10_0000;
-        let bitmap = AtomicBitmap::new(region_size, std::num::NonZeroUsize::new(0x1000).unwrap());
+        let bitmap =
+            AtomicBitmap::new(region_size, std::num::NonZeroUsize::new(page_size).unwrap());
         let builder = MmapRegionBuilder::new_with_bitmap(region_size, bitmap)
             .with_hugetlbfs(true)
             .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE);
@@ -620,14 +626,20 @@ mod tests {
     #[test]
     #[cfg(not(miri))] // Miri cannot mmap files
     fn test_mmap_region_fds_overlap() {
+        let page_size = crate::page_size();
+        let file_size = 3 * page_size as libc::off_t;
         let a = Arc::new(TempFile::new().unwrap().into_file());
-        assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), 1024 * 10) }, 0);
+        assert_eq!(unsafe { libc::ftruncate(a.as_raw_fd(), file_size) }, 0);
 
-        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), 4096).unwrap();
-        let r2 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 4096), 4096).unwrap();
+        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), page_size).unwrap();
+        let r2 =
+            MmapRegion::from_file(FileOffset::from_arc(a.clone(), page_size as u64), page_size)
+                .unwrap();
         assert!(!r1.fds_overlap(&r2));
 
-        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), 5000).unwrap();
+        // Extends into the first page mapped by `r2`.
+        let r1_size = page_size + 1000;
+        let r1 = MmapRegion::from_file(FileOffset::from_arc(a.clone(), 0), r1_size).unwrap();
         assert!(r1.fds_overlap(&r2));
 
         let r2 = MmapRegion::from_file(FileOffset::from_arc(a, 0), 1000).unwrap();
@@ -637,14 +649,14 @@ mod tests {
         let new_file = TempFile::new().unwrap().into_file();
         // Resize before mapping.
         assert_eq!(
-            unsafe { libc::ftruncate(new_file.as_raw_fd(), 1024 * 10) },
+            unsafe { libc::ftruncate(new_file.as_raw_fd(), file_size) },
             0
         );
-        let r2 = MmapRegion::from_file(FileOffset::new(new_file, 0), 5000).unwrap();
+        let r2 = MmapRegion::from_file(FileOffset::new(new_file, 0), r1_size).unwrap();
         assert!(!r1.fds_overlap(&r2));
 
         // R2 is not file backed, so no overlap.
-        let r2 = MmapRegion::new(5000).unwrap();
+        let r2 = MmapRegion::new(r1_size).unwrap();
         assert!(!r1.fds_overlap(&r2));
     }
 
@@ -653,7 +665,7 @@ mod tests {
     fn test_dirty_tracking() {
         // Using the `crate` prefix because we aliased `MmapRegion` to `MmapRegion<()>` for
         // the rest of the unit tests above.
-        let m = crate::MmapRegion::<AtomicBitmap>::new(0x1_0000).unwrap();
+        let m = crate::MmapRegion::<AtomicBitmap>::new(4 * crate::page_size()).unwrap();
         crate::bitmap::tests::test_volatile_memory(&m);
     }
 }
