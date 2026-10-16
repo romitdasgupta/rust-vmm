@@ -347,7 +347,8 @@ fn test_distributor_regs_and_reset() {
     if gic_params_or_skip().is_none() {
         return;
     }
-    let (_vm, gic) = vm_with_gic();
+    let (vm, gic) = vm_with_gic();
+    let mut vcpu = vcpu_with_aff0(&vm, 0);
 
     // Enable SPI 33 (`GICD_ISENABLER1` bit 1) and read it back.
     let isenabler1 = hv::HV_GIC_DISTRIBUTOR_REG_GICD_ISENABLER0 + 4;
@@ -355,9 +356,16 @@ fn test_distributor_regs_and_reset() {
     gic.set_distributor_reg(isenabler1, 0b10).unwrap();
     assert_eq!(gic.distributor_reg(isenabler1).unwrap() & 0b10, 0b10);
 
-    // A reset disables it again.
+    // Give the CPU interface a non-default priority mask.
+    vcpu.set_gic_icc_reg(hv::HV_GIC_ICC_REG_PMR_EL1, 0xf0)
+        .unwrap();
+
+    // A reset disables the SPI again...
     gic.reset().unwrap();
     assert_eq!(gic.distributor_reg(isenabler1).unwrap() & 0b10, 0);
+    // ...but leaves the CPU interface registers alone, as `Gic::reset`
+    // documents.
+    assert_eq!(vcpu.gic_icc_reg(hv::HV_GIC_ICC_REG_PMR_EL1).unwrap(), 0xf0);
 }
 
 #[test]

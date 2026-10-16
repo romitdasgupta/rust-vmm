@@ -178,8 +178,16 @@ impl Gic {
         check("hv_gic_send_msi", unsafe { f(addr, intid) })
     }
 
-    /// Resets the GIC, including every redistributor and CPU interface, to
-    /// its initial state (`hv_gic_reset`).
+    /// Resets the GIC distributor, the redistributor registers and the
+    /// internal state of the device (`hv_gic_reset`).
+    ///
+    /// The per-vCPU CPU interface registers are **not** reset: `ICC_*`
+    /// (and, with EL2 enabled, `ICH_*`) keep their values, for example
+    /// `ICC_PMR_EL1`, `ICC_BPR*_EL1` and `ICC_IGRPEN*_EL1`. To reset a guest
+    /// fully, for example on reboot, also restore each vCPU's CPU interface
+    /// state from its owning thread with
+    /// [`Vcpu::set_gic_icc_reg`](crate::Vcpu::set_gic_icc_reg) and
+    /// [`Vcpu::set_gic_ich_reg`](crate::Vcpu::set_gic_ich_reg).
     pub fn reset(&self) -> Result<()> {
         let f = need!(hv_gic_reset);
         // SAFETY: the function has no memory-safety preconditions.
