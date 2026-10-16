@@ -1,7 +1,8 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
-#![deny(missing_docs)]
 #![cfg(target_endian = "little")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
+#![deny(missing_docs)]
 //! Provides easy-to-use Linux seccomp-bpf jailing.
 //!
 //! Seccomp is a Linux kernel security feature which enables a tight control over what kernel-level
@@ -62,7 +63,7 @@
 //! `accept4`, `fcntl(any, F_SETFD, FD_CLOEXEC, ..)` and `fcntl(any, F_GETFD, ...)`.
 //! It allows any other syscalls.
 //!
-//! ```
+//! ```ignore-apple
 //! use seccompiler::{
 //!     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
 //!     SeccompRule,
@@ -119,7 +120,7 @@
 //!
 //! This second example defines and installs an equivalent JSON filter (uses the `json` feature):
 //!
-//! ```
+//! ```ignore-apple
 //! # #[cfg(feature = "json")]
 //! # {
 //! use seccompiler::BpfMap;

@@ -7,6 +7,7 @@
 // The application has an `EventManager` and can register multiple subscribers
 // of type `CounterSubscriber`.
 
+#![cfg(any(target_os = "linux", target_os = "android"))]
 #![cfg(feature = "test_utilities")]
 
 use std::ops::Drop;
