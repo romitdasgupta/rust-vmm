@@ -5,6 +5,8 @@ repository = "https://github.com/rust-vmm/rust-vmm"
 members = [
   "acpi_tables",
   "event-manager",
+  "hvf/hvf",
+  "hvf/hvf-bindings",
   "kvm/kvm-bindings",
   "kvm/kvm-ioctls",
   "linux-loader",
@@ -31,6 +33,7 @@ lto = true
 codegen-units = 1
 
 [workspace.dependencies]
+hvf-bindings = { version = "0.1.0", path = "hvf/hvf-bindings" }
 vm-memory = { version = "0.18.0", path = "vm-memory" }
 vmm-sys-util = { version = "0.15.0", path = "vmm-sys-util" }
 
