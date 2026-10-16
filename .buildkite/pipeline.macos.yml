@@ -1,0 +1,70 @@
+# Hypervisor.framework tests on self-hosted Apple silicon agents.
+#
+# The Linux pipeline (generated from test_description.json) only builds and
+# tests the portable parts of hvf-bindings and hvf, and the GitHub-hosted
+# macOS runners have no nested virtualization, so the tests that create VMs
+# only run here.
+#
+# Agent requirements:
+# - Apple silicon, macOS 15.0 or newer, running on the host (not inside a VM
+#   without nested virtualization): `sysctl kern.hv_support` must print 1.
+# - Xcode or the Command Line Tools (codesign, xcrun and the macOS SDK).
+# - rustup with the toolchain used by the Linux CI, and cargo-llvm-cov with
+#   the llvm-tools-preview component for the coverage step.
+# - Started with the tag `queue=macos-arm64`.
+#
+# Test binaries are signed with the com.apple.security.hypervisor entitlement
+# by the cargo runner in .cargo/config.toml (hvf/scripts/codesign-run.sh).
+# HVF_REQUIRE=1 turns every "SKIP" of a Hypervisor.framework test into a
+# failure, so a misconfigured agent cannot pass silently.
+#
+# Upload with:
+#   buildkite-agent pipeline upload .buildkite/pipeline.macos.yml
+#
+# Until such agents exist, maintainers run these commands locally on an Apple
+# silicon Mac before every hvf-bindings or hvf release.
+
+agents:
+  queue: "macos-arm64"
+
+env:
+  HVF_REQUIRE: "1"
+  CARGO_TERM_COLOR: "always"
+
+steps:
+  - label: "hvf: host info"
+    command:
+      - "sw_vers"
+      - "sysctl -n machdep.cpu.brand_string kern.hv_support"
+      - "xcrun --show-sdk-version"
+      - "rustc --version"
+    timeout_in_minutes: 5
+
+  - label: "hvf: unittests"
+    command: "cargo test -p hvf-bindings -p hvf --all-features"
+    timeout_in_minutes: 30
+
+  - label: "hvf: unittests-release"
+    command: "cargo test -p hvf-bindings -p hvf --all-features --release"
+    timeout_in_minutes: 30
+
+  - label: "hvf: sdk-check"
+    command: "cargo test -p hvf-bindings --test sdk_check"
+    env:
+      HVF_SDK_CHECK: "1"
+    timeout_in_minutes: 15
+
+  - label: "hvf: example-mmio_guest"
+    command: "cargo run -p hvf --example mmio_guest"
+    timeout_in_minutes: 15
+
+  - label: "hvf: clippy"
+    command: "cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks"
+    timeout_in_minutes: 15
+
+  # Informational only: the coverage scores enforced by CI are the Linux ones
+  # in hvf/*/coverage_config_*.json.
+  - label: "hvf: coverage"
+    command: "cargo llvm-cov -p hvf --all-features --summary-only"
+    soft_fail: true
+    timeout_in_minutes: 30

@@ -1,0 +1,82 @@
+name: macOS
+
+# Builds, lints and tests the workspace on Apple silicon macOS.
+#
+# GitHub-hosted macOS runners are virtual machines without nested
+# virtualization, so the Hypervisor.framework tests of `hvf-bindings` and
+# `hvf` print `SKIP` and pass here. They run for real on the self-hosted
+# Buildkite agents described in `.buildkite/pipeline.macos.yml`.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep in sync with the toolchain of the rustvmm/dev container used by the
+  # Linux Buildkite CI (`RUST_TOOLCHAIN` in rust-vmm-container's docker.env).
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  macos:
+    name: aarch64-apple-darwin
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+      run: |
+        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+        rustup default "$RUST_TOOLCHAIN"
+        rustc --version
+        xcrun --show-sdk-version
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Check the workspace
+      run: cargo check --workspace --all-targets
+      env:
+        RUSTFLAGS: "-D warnings"
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks
+
+    - name: Clippy (hvf crates, all features)
+      run: cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+
+    - name: Test the workspace
+      run: cargo test --workspace
+
+    - name: Test vm-memory with the mmap backends
+      run: cargo test -p vm-memory --features backend-mmap,backend-bitmap,backend-atomic,iommu
+
+    - name: Test the hvf crates with all features
+      run: cargo test -p hvf-bindings -p hvf --all-features
+
+    - name: Check the bindings against the SDK headers
+      run: cargo test -p hvf-bindings --test sdk_check
+      env:
+        HVF_SDK_CHECK: "1"
+
+    - name: Build the hvf documentation
+      run: cargo doc -p hvf -p hvf-bindings --all-features --no-deps
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+
+    - name: Check that hvf only uses run-time resolved newer functions
+      run: |
+        if grep -rn 'hvf_bindings::direct' hvf/hvf/src; then
+          echo "hvf must call functions newer than macOS 11.0 through DynApi, not hvf_bindings::direct" >&2
+          exit 1
+        fi

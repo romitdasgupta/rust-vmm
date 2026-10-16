@@ -1,0 +1,4 @@
+{
+  "coverage_score": 99.66,
+  "exclude_path": ".*(hvf-bindings/.*|vm-memory/.*|vm-device/.*|vmm-sys-util/.*)"
+}
