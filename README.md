@@ -40,7 +40,8 @@ rust-vmm crates in the root organization [rust-vmm](https://github.com/rust-vmm)
 - [hvf-bindings](hvf/hvf-bindings): Rust FFI bindings to the macOS
   Hypervisor.framework (Apple silicon).
 - [hvf](hvf/hvf): Safe wrappers over the macOS Hypervisor.framework (Apple
-  silicon).
+  silicon). Its [`boot_linux` example](hvf/hvf/examples/boot_linux/README.md)
+  boots arm64 Linux to a shell on a Mac.
 - [kvm-bindings](kvm/kvm-bindings): Rust FFI bindings to KVM.
 - [kvm-ioctls](kvm/kvm-ioctls): Safe wrappers over the KVM API.
 - [linux-loader](linux-loader): Linux kernel image loading crate.
