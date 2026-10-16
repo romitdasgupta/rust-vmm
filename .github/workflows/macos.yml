@@ -42,7 +42,7 @@ jobs:
         xcrun --show-sdk-version
 
     - name: Check formatting
-      run: cargo fmt --all -- --check
+      run: cargo fmt --all -- --check --config format_code_in_doc_comments=true
 
     - name: Check the workspace
       run: cargo check --workspace --all-targets

@@ -282,7 +282,10 @@ impl Vm {
     /// };
     /// assert_ne!(host, libc::MAP_FAILED);
     /// // SAFETY: the mapping outlives the VM, which is dropped first.
-    /// unsafe { vm.map(host.cast(), 0x4000_0000, size, MemoryFlags::RWX).unwrap() };
+    /// unsafe {
+    ///     vm.map(host.cast(), 0x4000_0000, size, MemoryFlags::RWX)
+    ///         .unwrap()
+    /// };
     /// vm.unmap(0x4000_0000, size).unwrap();
     /// ```
     pub unsafe fn map(

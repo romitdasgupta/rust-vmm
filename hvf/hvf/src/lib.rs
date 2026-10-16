@@ -91,7 +91,14 @@
 //! // 3. Map it into the guest.
 //! // SAFETY: the mapping stays valid until it is unmapped below, after the
 //! // VM is gone, and the host does not access it while the guest runs.
-//! unsafe { vm.map(host.cast(), GUEST_IPA, size, MemoryFlags::READ | MemoryFlags::EXEC)? };
+//! unsafe {
+//!     vm.map(
+//!         host.cast(),
+//!         GUEST_IPA,
+//!         size,
+//!         MemoryFlags::READ | MemoryFlags::EXEC,
+//!     )?
+//! };
 //!
 //! // 4. Create a vCPU on this thread and point it at the guest code.
 //! let mut vcpu = vm.create_vcpu(None)?;
