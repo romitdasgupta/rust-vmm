@@ -6,6 +6,7 @@
 use vm_fdt::{FdtWriter, FdtWriterResult};
 
 use super::layout::{GICD_BASE, GICR_BASE, RAM_BASE, UART_BASE, UART_SIZE, UART_SPI};
+use super::psci;
 
 /// Phandle of the interrupt controller.
 const PHANDLE_GIC: u32 = 1;
@@ -24,7 +25,7 @@ const PPI_BASE: u32 = 16;
 /// What the device tree describes.
 #[derive(Debug, Clone)]
 pub struct FdtParams {
-    /// Number of vCPUs; vCPU `i` has `MPIDR_EL1.Aff0 == i`.
+    /// Number of vCPUs; vCPU `i` has `MPIDR_EL1` [`psci::mpidr(i)`](psci::mpidr).
     pub cpus: u32,
     /// RAM size in bytes, starting at [`RAM_BASE`].
     pub ram_size: u64,
@@ -50,6 +51,11 @@ fn reg64(base: u64, size: u64) -> [u64; 2] {
     [base, size]
 }
 
+/// The `reg` of the node of vCPU `index`: its MPIDR[23:0].
+fn cpu_reg(index: u32) -> u32 {
+    (psci::mpidr(index as usize) & 0xff_ffff) as u32
+}
+
 /// Builds the device tree blob.
 pub fn build(p: &FdtParams) -> FdtWriterResult<Vec<u8>> {
     let mut fdt = FdtWriter::new()?;
@@ -61,17 +67,17 @@ pub fn build(p: &FdtParams) -> FdtWriterResult<Vec<u8>> {
     fdt.property_u32("#size-cells", 2)?;
     fdt.property_u32("interrupt-parent", PHANDLE_GIC)?;
 
-    // vCPU `i` has MPIDR_EL1 = 0x8000_0000 | i. With `#address-cells = 1`,
-    // `reg` holds MPIDR[23:0], which must match for Linux to find the boot
-    // CPU in the tree.
+    // With `#address-cells = 1`, `reg` holds MPIDR[23:0] (Aff2, Aff1, Aff0),
+    // which must match for Linux to find the boot CPU in the tree.
     let cpus = fdt.begin_node("cpus")?;
     fdt.property_u32("#address-cells", 1)?;
     fdt.property_u32("#size-cells", 0)?;
     for i in 0..p.cpus {
-        let cpu = fdt.begin_node(&format!("cpu@{i:x}"))?;
+        let reg = cpu_reg(i);
+        let cpu = fdt.begin_node(&format!("cpu@{reg:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
-        fdt.property_u32("reg", i)?;
+        fdt.property_u32("reg", reg)?;
         fdt.property_string("enable-method", "psci")?;
         fdt.end_node(cpu)?;
     }
@@ -219,6 +225,24 @@ mod tests {
             .flat_map(|v| v.to_be_bytes())
             .collect();
         assert!(contains(&dtb, &timer));
+    }
+
+    #[test]
+    fn test_cpu_nodes_in_clusters() {
+        assert_eq!(cpu_reg(15), 0xf);
+        assert_eq!(cpu_reg(16), 0x100);
+        let mut p = params();
+        p.cpus = 20;
+        let dtb = build(&p).unwrap();
+        for s in [&b"cpu@f\0"[..], b"cpu@100\0", b"cpu@103\0"] {
+            assert!(
+                contains(&dtb, s),
+                "{:?} missing",
+                String::from_utf8_lossy(s)
+            );
+        }
+        assert!(!contains(&dtb, b"cpu@10\0"));
+        assert!(!contains(&dtb, b"cpu@104\0"));
     }
 
     #[test]

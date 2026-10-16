@@ -64,11 +64,27 @@ const AFF_ON_PENDING: i32 = 2;
 
 /// The affinity fields of `MPIDR_EL1` (Aff3, Aff2, Aff1, Aff0).
 const MPIDR_AFF_MASK: u64 = 0xff_00ff_ffff;
+/// The affinity fields above Aff0, which name a cluster.
+const MPIDR_CLUSTER_MASK: u64 = MPIDR_AFF_MASK & !0xff;
 
-/// `MPIDR_EL1` of vCPU `index`: Aff0 is the index, so that the in-kernel GIC
-/// gives vCPU `i` the `i`-th redistributor frame. Bit 31 is RES1.
+/// The number of vCPUs in a cluster (an Aff1 value).
+///
+/// The CPU interface of the in-kernel GIC reports `ICC_CTLR_EL1.RSS == 0`,
+/// so an SGI can only target Aff0 values 0 to 15. Linux checks this and
+/// logs "CPUn can't SGI CPUm, no RSS" at critical level for every pair of
+/// CPUs that breaks it.
+pub const CLUSTER_SIZE: usize = 16;
+
+/// `MPIDR_EL1` of vCPU `index`: clusters of [`CLUSTER_SIZE`] vCPUs, as on
+/// QEMU's `virt` machine with GICv3, so Aff1 is `index / 16` and Aff0 is
+/// `index % 16`. Bit 31 is RES1.
+///
+/// The in-kernel GIC hands out the redistributor frames in vCPU id order,
+/// whatever the affinity, and Linux finds the frame of a CPU by the
+/// affinity in its `GICR_TYPER`.
 pub fn mpidr(index: usize) -> u64 {
-    0x8000_0000 | index as u64
+    let (aff1, aff0) = (index / CLUSTER_SIZE, index % CLUSTER_SIZE);
+    0x8000_0000 | ((aff1 as u64) << 8) | aff0 as u64
 }
 
 /// The power state of a vCPU.
@@ -212,17 +228,31 @@ impl Cpus {
     }
 
     fn affinity_info(&self, target: u64, level: u64) -> i32 {
-        if level != 0 {
-            // A single cluster, which is on while any vCPU runs a PSCI call.
-            return AFF_ON;
-        }
-        let Some(index) = self.index_of(target) else {
-            return INVALID_PARAMETERS;
+        let mask = match level {
+            0 => MPIDR_AFF_MASK,
+            1 => MPIDR_CLUSTER_MASK,
+            // Every cluster is in one node at levels 2 and 3, which is on
+            // while any vCPU runs a PSCI call.
+            2 | 3 => return AFF_ON,
+            _ => return INVALID_PARAMETERS,
         };
-        match *self.lock(index) {
-            PowerState::On => AFF_ON,
-            PowerState::Off => AFF_OFF,
-            PowerState::OnPending { .. } => AFF_ON_PENDING,
+        let states: Vec<PowerState> = (0..self.slots.len())
+            .filter(|&i| mpidr(i) & mask == target & mask)
+            .map(|i| *self.lock(i))
+            .collect();
+        // A cluster is on if any of its vCPUs is, and on pending if none is
+        // on but one is about to be.
+        if states.is_empty() {
+            INVALID_PARAMETERS
+        } else if states.contains(&PowerState::On) {
+            AFF_ON
+        } else if states
+            .iter()
+            .any(|s| matches!(s, PowerState::OnPending { .. }))
+        {
+            AFF_ON_PENDING
+        } else {
+            AFF_OFF
         }
     }
 }
@@ -307,14 +337,15 @@ mod tests {
         let info = |target: u64| handle(&cpus, [AFFINITY_INFO_64 as u64, target, 0, 0]);
 
         assert_eq!(info(mpidr(1)), Action::Return(1));
+        // vCPU 5 does not exist.
         assert_eq!(on(mpidr(5)), Action::Return(-2i64 as u64));
         assert_eq!(on(mpidr(0)), Action::Return(-4i64 as u64));
         assert_eq!(on(mpidr(1)), Action::Return(0));
         assert_eq!(info(mpidr(1)), Action::Return(2));
         assert_eq!(on(mpidr(1)), Action::Return(-5i64 as u64));
-        // Linux passes the affinity without bit 31.
         assert_eq!(cpus.wait_for_on(1), Some((0x8010_0000, 7)));
-        assert_eq!(info(1), Action::Return(0));
+        // Linux passes the affinity without bit 31.
+        assert_eq!(info(mpidr(1) & MPIDR_AFF_MASK), Action::Return(0));
 
         assert_eq!(handle(&cpus, [CPU_OFF as u64, 0, 0, 0]), Action::CpuOff);
         cpus.set_off(1);
@@ -322,5 +353,42 @@ mod tests {
 
         cpus.stop();
         assert_eq!(cpus.wait_for_on(1), None);
+    }
+
+    #[test]
+    fn test_mpidr_clusters() {
+        assert_eq!(mpidr(0), 0x8000_0000);
+        assert_eq!(mpidr(15), 0x8000_000f);
+        assert_eq!(mpidr(16), 0x8000_0100);
+        assert_eq!(mpidr(17), 0x8000_0101);
+        // Up to 123 vCPUs fit below the UART; none may need ICC_CTLR_EL1.RSS.
+        for i in 0..256 {
+            let (aff1, aff0) = ((mpidr(i) >> 8) & 0xff, mpidr(i) & 0xff);
+            assert!(aff0 < 16, "vCPU {i}: Aff0 {aff0} > 15");
+            assert_eq!(aff1 * 16 + aff0, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_second_cluster() {
+        let cpus = Cpus::new(20, 0x8000_0000, 0);
+        assert_eq!(cpus.wait_for_on(0), Some((0x8000_0000, 0)));
+        let on = |target: u64| handle(&cpus, [CPU_ON_64 as u64, target, 0x8010_0000, 7]);
+        let info =
+            |target: u64, level: u64| handle(&cpus, [AFFINITY_INFO_64 as u64, target, level, 0]);
+
+        // Aff1 = 1, Aff0 = 1 is vCPU 17; Aff0 = 4 in cluster 1 is past the
+        // last vCPU (19).
+        assert_eq!(on(0x101), Action::Return(0));
+        assert_eq!(on(0x104), Action::Return(-2i64 as u64));
+        assert_eq!(on(0x11), Action::Return(-2i64 as u64));
+        assert_eq!(cpus.wait_for_on(17), Some((0x8010_0000, 7)));
+        assert_eq!(info(0x101, 0), Action::Return(0));
+        assert_eq!(info(0x100, 0), Action::Return(1));
+        // Cluster 1 is on (vCPU 17 runs), cluster 2 does not exist.
+        assert_eq!(info(0x100, 1), Action::Return(0));
+        assert_eq!(info(0x200, 1), Action::Return(-2i64 as u64));
+        cpus.set_off(17);
+        assert_eq!(info(0x100, 1), Action::Return(1));
     }
 }
