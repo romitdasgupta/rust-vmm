@@ -1,6 +1,9 @@
 # Upcoming Release
 
 ## Changed
+- The crate is now empty on non-Linux targets (it is gated on
+  `target_os = "linux"` or `"android"`), so workspaces that also build for
+  macOS keep compiling.
 - [[#176]](https://github.com/rust-vmm/rust-vmm/pull/176): Update
   `syscall_tables` from v6.18 kernel source
 

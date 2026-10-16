@@ -1,3 +1,4 @@
+#![cfg(any(target_os = "linux", target_os = "android"))]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 /// This test is in a separate top-level test file so that it is isolated from the other tests -
