@@ -50,8 +50,7 @@ use crate::vm::{Vm, VmInner};
 #[derive(Debug, Clone)]
 pub struct Gic {
     /// Keeps the VM, and so the GIC, alive while the handle exists.
-    #[allow(dead_code)]
-    pub(crate) vm: Arc<VmInner>,
+    pub(crate) _vm: Arc<VmInner>,
     pub(crate) cfg: GicConfig,
 }
 
@@ -145,7 +144,7 @@ impl Vm {
         drop(topology);
 
         Ok(Gic {
-            vm: self.0.clone(),
+            _vm: self.0.clone(),
             cfg: *cfg,
         })
     }

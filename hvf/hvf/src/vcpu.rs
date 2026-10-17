@@ -65,16 +65,13 @@ pub struct Vcpu {
     pub(crate) shared: Arc<VcpuShared>,
     /// Keeps the VM alive while the vCPU exists. Dropped after `Drop::drop`
     /// destroyed the vCPU.
-    #[allow(dead_code)]
-    pub(crate) vm: Arc<VmInner>,
+    pub(crate) _vm: Arc<VmInner>,
     pub(crate) _not_send_sync: PhantomData<*mut ()>,
 }
 
 /// State shared between a [`Vcpu`] and its [`VcpuKicker`]s.
 #[derive(Debug)]
 pub(crate) struct VcpuShared {
-    /// The vCPU id.
-    pub(crate) id: hv_vcpu_t,
     /// `false` once the vCPU is being destroyed. Held across
     /// `hv_vcpu_destroy` and `hv_vcpus_exit`.
     pub(crate) alive: Mutex<bool>,
@@ -97,13 +94,15 @@ impl VcpuShared {
 /// destroyed vCPU: kicks after the destroy return `Ok(false)`.
 #[derive(Debug, Clone)]
 pub struct VcpuKicker {
+    /// The vCPU id, valid while `shared.alive` is true.
+    pub(crate) id: hv_vcpu_t,
     pub(crate) shared: Arc<VcpuShared>,
 }
 
 impl VcpuKicker {
     /// The id of the vCPU.
     pub fn id(&self) -> u64 {
-        self.shared.id
+        self.id
     }
 
     /// Kicks the vCPU (`hv_vcpus_exit`). Returns `Ok(false)` if the vCPU was
@@ -115,7 +114,7 @@ impl VcpuKicker {
         if !*alive {
             return Ok(false);
         }
-        let mut id = self.shared.id;
+        let mut id = self.id;
         // SAFETY: `hv_vcpus_exit` may be called from any thread and reads one
         // id from the valid pointer. The id names our live vCPU: its destroy
         // has not started, since `Vcpu::drop` clears `alive` under this lock
@@ -161,7 +160,6 @@ impl Vcpu {
         vm: Arc<VmInner>,
     ) -> Result<Vcpu> {
         let shared = Arc::new(VcpuShared {
-            id,
             alive: Mutex::new(true),
         });
         let Some(exit) = NonNull::new(exit) else {
@@ -176,7 +174,7 @@ impl Vcpu {
             id,
             exit,
             shared,
-            vm,
+            _vm: vm,
             _not_send_sync: PhantomData,
         })
     }
@@ -189,6 +187,7 @@ impl Vcpu {
     /// A handle that kicks this vCPU from any thread.
     pub fn kicker(&self) -> VcpuKicker {
         VcpuKicker {
+            id: self.id,
             shared: self.shared.clone(),
         }
     }
@@ -402,11 +401,28 @@ impl Vcpu {
         Reg::x(n).ok_or(Error::InvalidRegister(u32::from(n)))
     }
 
+    /// Completes an MMIO store described by `syndrome`: returns the value the
+    /// guest stores (the transfer register, 0 for `XZR`, masked to the access
+    /// size) and advances the PC. The caller performs the store with the
+    /// returned value.
+    ///
+    /// This is the store counterpart of
+    /// [`complete_mmio_read`](Self::complete_mmio_read): after either one,
+    /// do not call [`advance_pc`](Self::advance_pc). On error the PC is
+    /// left at the store.
+    pub fn complete_mmio_write(&mut self, syndrome: &DataAbortSyndrome) -> Result<u64> {
+        let value = self.mmio_write_value(syndrome)?;
+        self.advance_pc()?;
+        Ok(value)
+    }
+
     /// The value an MMIO store described by `syndrome` writes: the transfer
     /// register (0 for `XZR`) masked to the access size.
     ///
-    /// The caller performs the store and then calls
-    /// [`advance_pc`](Self::advance_pc).
+    /// Unlike [`complete_mmio_write`](Self::complete_mmio_write), this does
+    /// not advance the PC: the caller performs the store and then calls
+    /// [`advance_pc`](Self::advance_pc). Forgetting to makes the guest
+    /// repeat the store forever.
     pub fn mmio_write_value(&self, syndrome: &DataAbortSyndrome) -> Result<u64> {
         let reg = match syndrome.srt {
             XZR => 0,
@@ -431,73 +447,8 @@ impl Vcpu {
 mod tests {
     use super::*;
 
-    use std::thread;
-    use std::time::Duration;
-
     use crate::system::tests::hv_test_lock;
-    use crate::{ExceptionClass, Hvf, MemoryFlags, Vm, VmConfig};
-
-    /// `b .`
-    const SPIN: [u8; 4] = [0x00, 0x00, 0x00, 0x14];
-    /// `hvc #0; b .`
-    const HVC: [u8; 8] = [0x02, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0x14];
-    const GUEST_IPA: u64 = 0x4000_0000;
-
-    /// A VM with one granule of guest code at `GUEST_IPA`.
-    struct Guest {
-        vm: Vm,
-        host: *mut libc::c_void,
-        size: usize,
-    }
-
-    impl Guest {
-        fn new(code: &[u8]) -> Guest {
-            let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-            let size = vm.ipa_granule() as usize;
-            // SAFETY: an anonymous private mapping has no preconditions; the
-            // result is checked below.
-            let host = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANON | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(host, libc::MAP_FAILED);
-            // SAFETY: `host` is a fresh mapping of `size >= code.len()` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host.cast(), code.len()) };
-            // SAFETY: the mapping lives until `drop`, which runs after every
-            // test dropped its vCPUs, and the host does not touch it.
-            unsafe {
-                vm.map(
-                    host.cast(),
-                    GUEST_IPA,
-                    size,
-                    MemoryFlags::READ | MemoryFlags::EXEC,
-                )
-            }
-            .unwrap();
-            Guest { vm, host, size }
-        }
-
-        fn vcpu(&self) -> Vcpu {
-            let mut vcpu = self.vm.create_vcpu(None).unwrap();
-            vcpu.set_reg(Reg::PC, GUEST_IPA).unwrap();
-            vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
-            vcpu
-        }
-    }
-
-    impl Drop for Guest {
-        fn drop(&mut self) {
-            self.vm.unmap(GUEST_IPA, self.size).unwrap();
-            // SAFETY: the guest mapping was removed above.
-            unsafe { libc::munmap(self.host, self.size) };
-        }
-    }
+    use crate::{Hvf, VmConfig};
 
     #[test]
     fn test_send_sync() {
@@ -618,6 +569,21 @@ mod tests {
             Err(Error::InvalidRegister(32))
         );
 
+        // `complete_mmio_write` returns the same value and advances the PC,
+        // like `complete_mmio_read`; on error it leaves the PC alone.
+        vcpu.set_reg(Reg::PC, 0x2000).unwrap();
+        assert_eq!(
+            vcpu.complete_mmio_write(&syndrome(4, 3, false, true))
+                .unwrap(),
+            0x5566_7788
+        );
+        assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), 0x2004);
+        assert_eq!(
+            vcpu.complete_mmio_write(&syndrome(8, 32, false, true)),
+            Err(Error::InvalidRegister(32))
+        );
+        assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), 0x2004);
+
         vcpu.set_reg(Reg::PC, 0x1000).unwrap();
         vcpu.complete_mmio_read(&syndrome(1, 4, true, true), 0x80)
             .unwrap();
@@ -627,112 +593,5 @@ mod tests {
         vcpu.complete_mmio_read(&syndrome(4, 31, false, false), 1)
             .unwrap();
         assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), 0x1008);
-    }
-
-    #[test]
-    fn test_second_vcpu_on_thread() {
-        let Some(_g) = hv_test_lock() else { return };
-        let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        let vcpu = vm.create_vcpu(None).unwrap();
-        let e = vm.create_vcpu(None).unwrap_err();
-        assert!(
-            matches!(e, Error::Hv { call: "hv_vcpu_create", err } if err.is_busy()),
-            "{e:?}"
-        );
-        drop(vcpu);
-        // With the first one destroyed, the thread can own a new vCPU.
-        let cfg = crate::VcpuConfig::new().unwrap();
-        drop(vm.create_vcpu(Some(&cfg)).unwrap());
-    }
-
-    #[test]
-    fn test_kick_before_run() {
-        let Some(_g) = hv_test_lock() else { return };
-        let guest = Guest::new(&HVC);
-        let mut vcpu = guest.vcpu();
-        let kicker = vcpu.kicker();
-        assert_eq!(kicker.id(), vcpu.id());
-        assert!(kicker.kick().unwrap());
-        assert_eq!(vcpu.run().unwrap(), VcpuExit::Canceled);
-        // The kick is consumed: the next run reaches the guest.
-        match vcpu.run().unwrap() {
-            VcpuExit::Exception(e) => {
-                assert!(matches!(e.decode(), ExceptionClass::Hvc { imm: 0 }))
-            }
-            other => panic!("unexpected exit {other:?}"),
-        }
-        drop(vcpu);
-        // A kicker of a destroyed vCPU does nothing.
-        assert!(!kicker.kick().unwrap());
-    }
-
-    #[test]
-    fn test_kick_from_other_thread() {
-        let Some(_g) = hv_test_lock() else { return };
-        let guest = Guest::new(&SPIN);
-        let mut vcpu = guest.vcpu();
-        let kicker = vcpu.kicker();
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            kicker.kick().unwrap()
-        });
-        assert_eq!(vcpu.run().unwrap(), VcpuExit::Canceled);
-        assert!(handle.join().unwrap());
-    }
-
-    #[test]
-    fn test_stale_kicker_and_id_reuse() {
-        let Some(_g) = hv_test_lock() else { return };
-        let guest = Guest::new(&HVC);
-        let vcpu = guest.vcpu();
-        let stale = vcpu.kicker();
-        let old_id = vcpu.id();
-        drop(vcpu);
-
-        // The framework reuses the id of the destroyed vCPU.
-        let mut vcpu = guest.vcpu();
-        assert_eq!(vcpu.id(), old_id);
-        assert!(!stale.kick().unwrap());
-        match vcpu.run().unwrap() {
-            VcpuExit::Exception(e) => {
-                assert!(matches!(e.decode(), ExceptionClass::Hvc { imm: 0 }))
-            }
-            other => panic!("unexpected exit {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_vcpus_on_threads() {
-        let Some(_g) = hv_test_lock() else { return };
-        let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        let mut ids: Vec<u64> = thread::scope(|s| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-            let release_rx = Arc::new(Mutex::new(release_rx));
-            let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    let tx = tx.clone();
-                    let release_rx = release_rx.clone();
-                    let vm = &vm;
-                    s.spawn(move || {
-                        let vcpu = vm.create_vcpu(None).unwrap();
-                        tx.send(vcpu.id()).unwrap();
-                        // Keep every vCPU alive until all were created.
-                        release_rx.lock().unwrap().recv().unwrap();
-                    })
-                })
-                .collect();
-            let ids = (0..8).map(|_| rx.recv().unwrap()).collect();
-            for _ in 0..8 {
-                release_tx.send(()).unwrap();
-            }
-            for h in handles {
-                h.join().unwrap();
-            }
-            ids
-        });
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), 8);
     }
 }

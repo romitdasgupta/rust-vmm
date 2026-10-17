@@ -11,26 +11,9 @@ use hvf_bindings::{
 };
 
 /// `errno` values of the host, used by [`HvError::to_errno`].
+#[cfg(any(unix, windows, target_os = "wasi"))]
 mod errno {
-    #[cfg(target_os = "macos")]
     pub(super) use libc::{EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOMEM, ENOTSUP, EPERM};
-
-    // `libc` is only a dependency on macOS. These are the Linux values, which
-    // is where the portable part of the crate is built and tested otherwise.
-    // All but `ENOTSUP` are the same on every Unix.
-    #[cfg(not(target_os = "macos"))]
-    mod values {
-        pub const EPERM: i32 = 1;
-        pub const EIO: i32 = 5;
-        pub const ENOMEM: i32 = 12;
-        pub const EBUSY: i32 = 16;
-        pub const EEXIST: i32 = 17;
-        pub const ENODEV: i32 = 19;
-        pub const EINVAL: i32 = 22;
-        pub const ENOTSUP: i32 = 95;
-    }
-    #[cfg(not(target_os = "macos"))]
-    pub(super) use values::*;
 }
 
 /// A non-success `hv_return_t` returned by Hypervisor.framework.
@@ -61,9 +44,14 @@ impl HvError {
         self.0 == HV_BAD_ARGUMENT
     }
 
-    /// Whether the error means the hypervisor cannot be used at all on this
-    /// host or by this binary: `HV_DENIED`, `HV_UNSUPPORTED` or
-    /// `HV_NO_DEVICE`.
+    /// `HV_DENIED`, `HV_UNSUPPORTED` or `HV_NO_DEVICE`: when `hv_vm_create`
+    /// returns one of them, the hypervisor cannot be used on this host or by
+    /// this binary.
+    ///
+    /// Only meaningful for `hv_vm_create`. Other calls return
+    /// `HV_UNSUPPORTED` or `HV_NO_DEVICE` for configuration errors on a
+    /// working host: an IPA size above the maximum, a GIC call on a VM
+    /// without a GIC, or `Vcpu::wfi_time` without a GIC. Prefer [`Error::is_unavailable`], which checks the call.
     pub fn is_unavailable(&self) -> bool {
         matches!(self.0, HV_DENIED | HV_UNSUPPORTED | HV_NO_DEVICE)
     }
@@ -73,6 +61,9 @@ impl HvError {
     /// `HV_UNSUPPORTED` to `ENOTSUP`, `HV_NO_RESOURCES` to `ENOMEM`,
     /// `HV_NO_DEVICE` to `ENODEV`, `HV_EXISTS` to `EEXIST` and everything else
     /// to `EIO`.
+    ///
+    /// Only on targets with `errno` values (Unix, Windows and WASI).
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub fn to_errno(&self) -> i32 {
         match self.0 {
             HV_BUSY => errno::EBUSY,
@@ -112,7 +103,7 @@ impl HvError {
             ),
             HV_ILLEGAL_GUEST_STATE => ("HV_ILLEGAL_GUEST_STATE", "illegal guest state"),
             HV_NO_RESOURCES => ("HV_NO_RESOURCES", "out of resources"),
-            HV_NO_DEVICE => ("HV_NO_DEVICE", "no hypervisor device"),
+            HV_NO_DEVICE => ("HV_NO_DEVICE", "no such device (no VM or no GIC)"),
             HV_DENIED => ("HV_DENIED", "binary lacks com.apple.security.hypervisor"),
             HV_EXISTS => ("HV_EXISTS", "already exists"),
             HV_UNSUPPORTED => ("HV_UNSUPPORTED", "operation not supported"),
@@ -195,6 +186,26 @@ pub enum Error {
     InvalidRegister(u32),
     /// A `*_create()` function returned a null object.
     NullObject(&'static str),
+    /// A guest memory region has no host address, so it cannot be mapped.
+    NoHostAddress {
+        /// Guest physical address of the region.
+        ipa: u64,
+    },
+}
+
+impl Error {
+    /// Whether `Hvf::create_vm` failed because Hypervisor.framework cannot be
+    /// used on this host or by this binary: `hv_vm_create` returned
+    /// `HV_DENIED` (the binary lacks the `com.apple.security.hypervisor`
+    /// entitlement), `HV_UNSUPPORTED` or `HV_NO_DEVICE` (Intel Mac, or a VM
+    /// without nested virtualization).
+    ///
+    /// False for every other error, including the `HV_UNSUPPORTED` and
+    /// `HV_NO_DEVICE` that other calls return for configuration errors (see
+    /// [`HvError::is_unavailable`]).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Error::Hv { call: "hv_vm_create", err } if err.is_unavailable())
+    }
 }
 
 impl fmt::Display for Error {
@@ -220,18 +231,17 @@ impl fmt::Display for Error {
             Error::GicExists => write!(f, "the VM already has a GIC"),
             Error::InvalidRegister(reg) => write!(f, "invalid register {reg}"),
             Error::NullObject(call) => write!(f, "{call} returned a null object"),
+            Error::NoHostAddress { ipa } => {
+                write!(f, "guest memory region at {ipa:#x} has no host address")
+            }
         }
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Hv { err, .. } => Some(err),
-            _ => None,
-        }
-    }
-}
+// The `Display` of `Error::Hv` already includes the `HvError`, so `source()`
+// does not return it as well: error-chain reporters would print it twice.
+// Match `Error::Hv { err, .. }` to get the code.
+impl std::error::Error for Error {}
 
 impl From<Error> for io::Error {
     /// Converts to an [`io::Error`] that keeps `e` as its inner error. The
@@ -247,7 +257,8 @@ impl From<Error> for io::Error {
             | Error::OutOfRange { .. }
             | Error::Overlap { .. }
             | Error::GicAfterVcpu
-            | Error::InvalidRegister(_) => io::ErrorKind::InvalidInput,
+            | Error::InvalidRegister(_)
+            | Error::NoHostAddress { .. } => io::ErrorKind::InvalidInput,
             Error::NullObject(_) => io::ErrorKind::OutOfMemory,
         };
         io::Error::new(kind, e)
@@ -304,6 +315,38 @@ mod tests {
     }
 
     #[test]
+    fn test_error_is_unavailable() {
+        let hv = |call, code| Error::Hv {
+            call,
+            err: HvError(code),
+        };
+        for code in [HV_DENIED, HV_UNSUPPORTED, HV_NO_DEVICE] {
+            assert!(hv("hv_vm_create", code).is_unavailable(), "{code:#x}");
+        }
+        for code in [HV_BUSY, HV_ERROR, HV_BAD_ARGUMENT, HV_NO_RESOURCES] {
+            assert!(!hv("hv_vm_create", code).is_unavailable(), "{code:#x}");
+        }
+        // Configuration errors on a working host, not an unusable hypervisor.
+        for (call, code) in [
+            ("hv_vm_config_set_ipa_size", HV_UNSUPPORTED),
+            ("hv_gic_get_redistributor_base", HV_NO_DEVICE),
+            ("hv_vcpu_get_wait_for_interrupt_time", HV_UNSUPPORTED),
+            ("hv_vcpu_set_pending_interrupt", HV_UNSUPPORTED),
+        ] {
+            assert!(!hv(call, code).is_unavailable(), "{call}");
+        }
+        assert!(
+            !Error::Unavailable {
+                api: "hv_gic_create",
+                since: (15, 0),
+            }
+            .is_unavailable()
+        );
+        assert!(!Error::VmExists.is_unavailable());
+    }
+
+    #[test]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     fn test_to_errno() {
         let cases = [
             (HV_BUSY, errno::EBUSY),
@@ -323,9 +366,10 @@ mod tests {
         // Spot-check the host values.
         assert_eq!(HvError(HV_BUSY).to_errno(), 16);
         assert_eq!(HvError(HV_BAD_ARGUMENT).to_errno(), 22);
+        assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), libc::ENOTSUP);
         #[cfg(target_os = "macos")]
         assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), 45);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), 95);
     }
 
@@ -406,6 +450,10 @@ mod tests {
                 Error::NullObject("hv_vm_config_create"),
                 "hv_vm_config_create returned a null object",
             ),
+            (
+                Error::NoHostAddress { ipa: 0x4000_0000 },
+                "guest memory region at 0x40000000 has no host address",
+            ),
         ];
         for (e, s) in cases {
             assert_eq!(e.to_string(), s);
@@ -416,12 +464,15 @@ mod tests {
     fn test_error_source() {
         use std::error::Error as _;
 
+        // The code is part of the message, so it is not also the source,
+        // which a chain reporter would print a second time.
         let e = Error::Hv {
             call: "hv_vcpu_run",
             err: HvError(HV_ERROR),
         };
-        let source = e.source().unwrap().downcast_ref::<HvError>().unwrap();
-        assert_eq!(*source, HvError(HV_ERROR));
+        assert!(e.source().is_none());
+        assert!(e.to_string().contains(&HvError(HV_ERROR).to_string()));
+        assert!(io::Error::from(e).source().is_none());
         assert!(Error::VmExists.source().is_none());
     }
 
@@ -521,6 +572,10 @@ mod tests {
             (
                 Error::NullObject("hv_gic_config_create"),
                 io::ErrorKind::OutOfMemory,
+            ),
+            (
+                Error::NoHostAddress { ipa: 0x4000_0000 },
+                io::ErrorKind::InvalidInput,
             ),
         ];
         for (e, kind) in cases {

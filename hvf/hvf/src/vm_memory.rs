@@ -27,7 +27,7 @@ impl Vm {
     /// overlap in the guest physical address space. The first violation is
     /// returned:
     ///
-    /// - [`Error::NullObject`] for a region without a host address (one whose
+    /// - [`Error::NoHostAddress`] for a region without a host address (one whose
     ///   [`GuestMemoryRegion::get_host_address`] fails or returns null);
     /// - [`Error::Misaligned`] or [`Error::OutOfRange`] as for [`Vm::map`];
     /// - [`Error::Overlap`] for overlapping regions.
@@ -125,13 +125,14 @@ impl Vm {
 
 /// Returns the host address, guest address and size of `region`.
 fn region_mapping<R: GuestMemoryRegion>(region: &R) -> Result<Mapping> {
-    const NO_HOST_ADDRESS: Error = Error::NullObject("GuestMemoryRegion::get_host_address");
-
+    let no_host_address = Error::NoHostAddress {
+        ipa: region.start_addr().raw_value(),
+    };
     let host = region
         .get_host_address(MemoryRegionAddress(0))
-        .map_err(|_| NO_HOST_ADDRESS)?;
+        .map_err(|_| no_host_address.clone())?;
     if host.is_null() {
-        return Err(NO_HOST_ADDRESS);
+        return Err(no_host_address);
     }
     let len = region.len();
     let size = usize::try_from(len).map_err(|_| Error::OutOfRange {

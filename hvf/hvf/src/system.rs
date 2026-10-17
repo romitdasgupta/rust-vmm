@@ -216,12 +216,12 @@ impl Hvf {
     ///
     /// The binary must be signed with the `com.apple.security.hypervisor`
     /// entitlement, otherwise this fails with `HV_DENIED`
-    /// ([`HvError::is_unavailable`](crate::HvError::is_unavailable)).
+    /// ([`Error::is_unavailable`](crate::Error::is_unavailable)).
     ///
     /// If the previous VM could not be destroyed when its last handle was
-    /// dropped (for example because a vCPU leaked on an exiting thread was
-    /// still being torn down), the destroy is retried first and its error is
-    /// returned if it still fails.
+    /// dropped (because a vCPU created through `hvf-bindings` directly still
+    /// existed), the destroy is retried first and its error is returned if it
+    /// still fails.
     ///
     /// # Example
     ///
@@ -458,7 +458,7 @@ pub(crate) mod tests {
         } else {
             match Hvf::create_vm(&VmConfig::default()) {
                 Ok(_) => return Some(guard),
-                Err(Error::Hv { err, .. }) if err.is_unavailable() => err.to_string(),
+                Err(e) if e.is_unavailable() => e.to_string(),
                 Err(e) => panic!("cannot create a VM: {e}"),
             }
         };
@@ -519,12 +519,19 @@ pub(crate) mod tests {
         }
         assert!(Hvf::max_vcpu_count().unwrap() >= 1);
 
-        let max = Hvf::max_ipa_bits().unwrap();
-        let default = Hvf::default_ipa_bits().unwrap();
-        assert!((32..=52).contains(&max), "{max}");
-        assert!(default <= max, "{default} > {max}");
-
-        // Newer probes either work or report the release they need.
+        // Newer probes either work or report the release they need. The
+        // crate supports macOS 11.0; the IPA size probes need 13.0.
+        match (Hvf::max_ipa_bits(), Hvf::default_ipa_bits()) {
+            (Ok(max), Ok(default)) => {
+                assert!((32..=52).contains(&max), "{max}");
+                assert!(default <= max, "{default} > {max}");
+            }
+            (
+                Err(Error::Unavailable { since: (13, 0), .. }),
+                Err(Error::Unavailable { since: (13, 0), .. }),
+            ) => {}
+            r => panic!("{r:?}"),
+        }
         match Hvf::el2_supported() {
             Ok(_) | Err(Error::Unavailable { since: (15, 0), .. }) => {}
             Err(e) => panic!("{e}"),
@@ -587,7 +594,9 @@ pub(crate) mod tests {
     fn test_create_vm_default() {
         let Some(_g) = hv_test_lock() else { return };
         let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        assert_eq!(vm.ipa_bits(), Hvf::default_ipa_bits().unwrap());
+        // Before macOS 13.0 there is no probe, and the size is 36 bits.
+        let ipa_bits = or_if_unavailable(Hvf::default_ipa_bits(), LEGACY_IPA_BITS).unwrap();
+        assert_eq!(vm.ipa_bits(), ipa_bits);
         let granule = or_if_unavailable(Hvf::default_ipa_granule(), IpaGranule::K16).unwrap();
         assert_eq!(vm.ipa_granule(), granule.bytes());
         assert!(!vm.el2_enabled());
@@ -598,51 +607,5 @@ pub(crate) mod tests {
         drop(vm);
         // Dropping the VM frees the slot.
         drop(Hvf::create_vm(&VmConfig::default()).unwrap());
-    }
-
-    #[test]
-    fn test_create_vm_config() {
-        let Some(_g) = hv_test_lock() else { return };
-        let max = Hvf::max_ipa_bits().unwrap();
-
-        let cfg = VmConfig {
-            ipa_bits: Some(max),
-            ..Default::default()
-        };
-        let vm = Hvf::create_vm(&cfg).unwrap();
-        assert_eq!(vm.ipa_bits(), max);
-        assert_eq!(vm.ipa_granule(), IpaGranule::K16.bytes());
-        drop(vm);
-
-        // An IPA size beyond the maximum is rejected by the setter, and the
-        // slot is released.
-        let cfg = VmConfig {
-            ipa_bits: Some(max + 1),
-            ..Default::default()
-        };
-        let e = Hvf::create_vm(&cfg).unwrap_err();
-        assert!(matches!(e, Error::Hv { .. }), "{e:?}");
-        drop(Hvf::create_vm(&VmConfig::default()).unwrap());
-
-        // The 4 KiB granule (macOS 26.0).
-        let cfg = VmConfig {
-            ipa_granule: Some(IpaGranule::K4),
-            ..Default::default()
-        };
-        match Hvf::create_vm(&cfg) {
-            Ok(vm) => assert_eq!(vm.ipa_granule(), 4096),
-            Err(Error::Unavailable { since: (26, 0), .. }) => {}
-            Err(e) => panic!("{e}"),
-        }
-
-        // EL2, where supported (macOS 15.0, M3 or newer).
-        if Hvf::el2_supported().unwrap_or(false) {
-            let cfg = VmConfig {
-                el2: true,
-                ..Default::default()
-            };
-            let vm = Hvf::create_vm(&cfg).unwrap();
-            assert!(vm.el2_enabled());
-        }
     }
 }

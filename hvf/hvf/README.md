@@ -163,9 +163,14 @@ The host probes (`Hvf::max_vcpu_count`, `max_ipa_bits`, `default_ipa_bits`,
 `gic_intid`) and `VcpuConfig` need neither the entitlement nor an existing VM.
 They return the same values in unsigned binaries.
 
-`HvError::is_unavailable()` is true for `HV_DENIED`, `HV_UNSUPPORTED` and
-`HV_NO_DEVICE`. Use it to tell "hypervisor not usable here" (unsigned binary,
-Intel Mac, VM without nested virtualization) apart from real failures.
+`Error::is_unavailable()` is true when `hv_vm_create` failed with
+`HV_DENIED`, `HV_UNSUPPORTED` or `HV_NO_DEVICE`. Use it on the result of
+`Hvf::create_vm` to tell "hypervisor not usable here" (unsigned binary, Intel
+Mac, VM without nested virtualization) apart from real failures. Other calls
+return `HV_UNSUPPORTED` or `HV_NO_DEVICE` for configuration errors on a
+working host (an IPA size above the maximum, GIC calls on a VM without a GIC,
+`Vcpu::wfi_time` without a GIC), so do not apply
+`HvError::is_unavailable()`, which only looks at the code, to them.
 `Hvf::is_supported()` reads `kern.hv_support` and does not look at the
 entitlement.
 
@@ -180,12 +185,13 @@ keeps it alive, and the VM is destroyed when the last handle is dropped. A
 the process. That is a leak, not undefined behaviour.
 
 `hv_vm_destroy` fails while a vCPU still exists. This can happen when vCPUs
-were created through `hvf-bindings` directly, or when a thread that owned a
-leaked vCPU has not yet been cleaned up by the framework. The crate then
+were created through `hvf-bindings` directly and still exist. The crate then
 records the VM as a *zombie*. The next `create_vm` retries the destroy, fails
 with `Error::Hv { call: "hv_vm_destroy", .. }` (`HV_BUSY`) while the vCPU
 still exists, and succeeds once the framework has released it. On macOS 27
-that takes a few milliseconds after the owning thread exits.
+that takes a few milliseconds after the owning thread exits. A leaked `Vcpu`
+cannot cause a zombie: it keeps the VM alive, so `create_vm` fails with
+`Error::VmExists` instead.
 
 ## Threading
 
@@ -251,15 +257,20 @@ The `hv_vm_allocate` allocator is not wrapped. Use `mmap` or vm-memory.
 VMM. `Exception::decode()` turns the syndrome into an `ExceptionClass`. Apart
 from `HVC`, the PC still points at the trapping instruction when `run`
 returns. The VMM must call `Vcpu::advance_pc()` after emulating the
-instruction. `ExceptionClass::pc_advanced_by_hw()` reports which case applies.
+instruction, except after `Vcpu::complete_mmio_read` and
+`Vcpu::complete_mmio_write`, which advance it themselves. An abort resolved
+by letting the guest retry (after `Vm::protect` or `Vm::map`) must not be
+advanced. `ExceptionClass::pc_advanced_by_hw()` reports whether the PC has
+already moved on.
 
 | Exit | PC on exit | VMM action |
 |---|---|---|
 | `Hvc { imm }` | already past the `hvc` | emulate (PSCI, hypercall); **do not** advance |
 | `Smc { imm }` | at the `smc` | emulate, then `advance_pc` |
 | `SysReg(access)` | at the `mrs`/`msr` | emulate, then `advance_pc` |
-| `DataAbort(abort)` (MMIO) | at the load or store | `mmio_write_value` + `advance_pc`, or `complete_mmio_read` |
+| `DataAbort(abort)` (MMIO) | at the load or store | `complete_mmio_write` or `complete_mmio_read` (both advance the PC) |
 | `Wfx { wfe }` | at the `wfi`/`wfe` | wait (see below), then `advance_pc` |
+| `WfxTimeout { wfe, timeout_reg }` | at the `wfit`/`wfet` | wait, at most until the deadline in `timeout_reg`, then `advance_pc` |
 | `InstructionAbort`, `Breakpoint`, `SoftwareStep`, `Watchpoint`, `Brk` | at the instruction | VMM-specific |
 
 The crate does not set `MPIDR_EL1` or `CPSR`. Both start at 0. Set `CPSR`
@@ -276,15 +287,16 @@ syndrome is valid (`abort.syndrome` is `Some`):
 ```rust
 let access = abort.syndrome.expect("ISV=0: decode the instruction yourself");
 if abort.write {
-    let value = vcpu.mmio_write_value(&access)?; // Rt masked to access.len bytes
+    let value = vcpu.complete_mmio_write(&access)?; // Rt masked to access.len bytes, advances PC
     bus.write(abort.ipa, &value.to_le_bytes()[..usize::from(access.len)]);
-    vcpu.advance_pc()?;
 } else {
     let raw = bus.read(abort.ipa, usize::from(access.len));
     vcpu.complete_mmio_read(&access, raw)?; // sign/zero extends, writes Rt, advances PC
 }
 ```
 
+`Vcpu::mmio_write_value` returns the store value without advancing the PC,
+for a VMM that wants to advance it only once the store succeeded.
 `hvf::mmio_load_value` and `hvf::mmio_store_value` provide the same
 arithmetic without a vCPU.
 
@@ -300,6 +312,14 @@ an SPI from `Gic::set_spi` on any thread, or an SGI from another vCPU) and
 returns `Canceled` on a kick, with the PC already past the `wfi`.
 
 On macOS 27, `wfe` does not exit in either case.
+
+`wfit` and `wfet` (`FEAT_WFxT`) take a deadline in a register, compared
+against `CNTVCT_EL0`. The framework hides the feature in `ID_AA64ISAR2_EL1`
+by default. Without the in-kernel GIC, a guest that uses `wfit` anyway exits
+with `ExceptionClass::WfxTimeout`: sleep until the earlier of the timer
+deadline and the value of `X[timeout_reg]`. With the in-kernel GIC, `wfit`
+does not exit and the framework was observed to ignore its deadline, so do
+not advertise `FEAT_WFxT` to the guest.
 
 ## Interrupts without the in-kernel GIC
 

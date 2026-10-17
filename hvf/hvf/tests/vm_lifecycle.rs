@@ -177,8 +177,7 @@ fn test_ipa_granule_and_el2_configs() {
 /// a reference to the VM, so forgetting it leaks the VM for the rest of the
 /// process (`create_vm` then fails with `VmExists`, as documented). Instead,
 /// a vCPU created directly through the bindings, behind the crate's back,
-/// keeps `hv_vm_destroy` busy while its thread lives. This is what happens
-/// when a thread that owned a leaked vCPU has not been reaped yet.
+/// keeps `hv_vm_destroy` busy while its thread lives.
 #[test]
 fn test_zombie_vm_recovery() {
     let Some(_g) = hv_guard() else { return };

@@ -6,19 +6,21 @@
 //! Hypervisor.framework has a single, implicit VM per process. Its lifetime is
 //! tracked by the process-wide [`VM_STATE`] slot:
 //!
-//! - [`VmSlot::claim`] moves the slot from `VM_FREE` to `VM_LIVE` before
+//! - [`VmSlot::claim`] moves the slot from `Free` to `Live` before
 //!   `hv_vm_create`, so at most one [`Vm`] exists at a time.
 //! - Every `Vm`, [`Vcpu`] and [`Gic`](crate::Gic) handle holds an
 //!   `Arc<VmInner>`. Dropping the last one destroys the VM and frees the
 //!   slot.
-//! - If `hv_vm_destroy` keeps failing (for example because a forgotten vCPU
-//!   of an exited thread is still being torn down by the framework), the slot
-//!   becomes `VM_ZOMBIE` and the next `create_vm` retries the destroy.
+//! - If `hv_vm_destroy` keeps failing (because a vCPU created through
+//!   `hvf-bindings`, behind the crate's back, still exists on a live
+//!   thread), the slot becomes `Zombie` and the next `create_vm` retries
+//!   the destroy. A leaked [`Vcpu`] cannot cause this: it keeps its
+//!   `Arc<VmInner>`, so the slot stays `Live` and `create_vm` fails with
+//!   `VmExists` for the rest of the process.
 
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -33,17 +35,26 @@ use crate::error::{Error, Result, check};
 use crate::system::VcpuConfig;
 use crate::vcpu::Vcpu;
 
-/// No VM exists.
-pub(crate) const VM_FREE: u8 = 0;
-/// A VM exists.
-pub(crate) const VM_LIVE: u8 = 1;
-/// The last VM was dropped but `hv_vm_destroy` failed; the next `create_vm`
-/// retries the destroy.
-pub(crate) const VM_ZOMBIE: u8 = 2;
+/// State of the process-wide VM slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    /// No VM exists.
+    Free,
+    /// A VM exists, or a claim is about to create one.
+    Live,
+    /// The last VM was dropped but `hv_vm_destroy` failed; the next
+    /// `create_vm` retries the destroy.
+    Zombie,
+}
 
-/// State of the process-wide VM slot: one of `VM_FREE`, `VM_LIVE` or
-/// `VM_ZOMBIE`.
-pub(crate) static VM_STATE: AtomicU8 = AtomicU8::new(VM_FREE);
+/// The process-wide VM slot.
+static VM_STATE: Mutex<SlotState> = Mutex::new(SlotState::Free);
+
+/// Locks the VM slot, ignoring poisoning (the state is a plain enum that is
+/// always consistent).
+fn slot_state() -> MutexGuard<'static, SlotState> {
+    VM_STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How often `hv_vm_destroy` is attempted while it returns `HV_BUSY`.
 const DESTROY_ATTEMPTS: u32 = 50;
@@ -92,27 +103,16 @@ impl VmSlot {
     /// could not be destroyed, the destroy is retried first; if it still
     /// fails, its error is returned and the slot stays a zombie.
     pub(crate) fn claim() -> Result<VmSlot> {
-        loop {
-            match VM_STATE.compare_exchange(VM_FREE, VM_LIVE, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Ok(VmSlot { _private: () }),
-                Err(VM_ZOMBIE) => {
-                    if VM_STATE
-                        .compare_exchange(VM_ZOMBIE, VM_LIVE, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        // Another thread changed the state; look again.
-                        continue;
-                    }
-                    // The slot is ours and no handle to the old VM exists.
-                    if let Err(e) = destroy_vm() {
-                        VM_STATE.store(VM_ZOMBIE, Ordering::Release);
-                        return Err(e);
-                    }
-                    return Ok(VmSlot { _private: () });
-                }
-                Err(_) => return Err(Error::VmExists),
-            }
+        let mut state = slot_state();
+        match *state {
+            SlotState::Free => {}
+            SlotState::Live => return Err(Error::VmExists),
+            // No handle to the old VM exists. Holding the lock across the
+            // retries makes a concurrent `create_vm` wait for the outcome.
+            SlotState::Zombie => destroy_vm()?,
         }
+        *state = SlotState::Live;
+        Ok(VmSlot { _private: () })
     }
 
     /// Hands the slot over to a newly created VM with the given effective
@@ -132,7 +132,7 @@ impl VmSlot {
     /// then frees the slot (or leaves it a zombie if the destroy fails).
     pub(crate) fn destroy_created(self) {
         if destroy_vm().is_err() {
-            VM_STATE.store(VM_ZOMBIE, Ordering::Release);
+            *slot_state() = SlotState::Zombie;
             mem::forget(self);
         }
     }
@@ -140,7 +140,7 @@ impl VmSlot {
 
 impl Drop for VmSlot {
     fn drop(&mut self) {
-        VM_STATE.store(VM_FREE, Ordering::Release);
+        *slot_state() = SlotState::Free;
     }
 }
 
@@ -175,7 +175,7 @@ pub struct Vm(pub(crate) Arc<VmInner>);
 
 /// Shared state of the VM.
 ///
-/// Exactly one `VmInner` exists while the VM slot is `VM_LIVE` with a VM
+/// Exactly one `VmInner` exists while the VM slot is `Live` with a VM
 /// handed out; it owns the slot and destroys the VM on drop.
 #[derive(Debug)]
 pub(crate) struct VmInner {
@@ -199,15 +199,15 @@ impl VmInner {
 
 impl Drop for VmInner {
     fn drop(&mut self) {
-        // Every `Vm`, `Vcpu` and `Gic` handle is gone, and every vCPU was
-        // destroyed by its handle (or leaked, in which case the framework
-        // destroys it when its thread exits).
-        let state = if destroy_vm().is_ok() {
-            VM_FREE
+        // Every `Vm`, `Vcpu` and `Gic` handle is gone, so every vCPU created
+        // through this crate was destroyed by its handle (a leaked `Vcpu`
+        // keeps this `VmInner` alive). Only vCPUs created through
+        // `hvf-bindings` directly can still make the destroy fail.
+        *slot_state() = if destroy_vm().is_ok() {
+            SlotState::Free
         } else {
-            VM_ZOMBIE
+            SlotState::Zombie
         };
-        VM_STATE.store(state, Ordering::Release);
     }
 }
 
@@ -217,7 +217,6 @@ pub(crate) struct Topology {
     /// At least one vCPU was created.
     pub(crate) vcpu_created: bool,
     /// The in-kernel GIC was created.
-    #[allow(dead_code)]
     pub(crate) gic: bool,
 }
 
@@ -397,127 +396,23 @@ mod tests {
     }
 
     /// An anonymous mapping freed on drop.
-    struct AnonMem {
-        ptr: *mut u8,
-        size: usize,
-    }
-
-    impl AnonMem {
-        fn new(size: usize) -> Self {
-            // SAFETY: an anonymous private mapping has no preconditions; the
-            // result is checked below.
-            let ptr = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANON | libc::MAP_PRIVATE,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(ptr, libc::MAP_FAILED);
-            AnonMem {
-                ptr: ptr.cast(),
-                size,
-            }
-        }
-    }
-
-    impl Drop for AnonMem {
-        fn drop(&mut self) {
-            // SAFETY: `ptr` is a mapping of `size` bytes created in `new`;
-            // the tests drop it only after the VM using it is gone.
-            unsafe { libc::munmap(self.ptr.cast(), self.size) };
-        }
-    }
-
-    #[test]
-    fn test_map_unmap_protect() {
-        let Some(_g) = hv_test_lock() else { return };
-        let mem = AnonMem::new(4 * Hvf::host_page_size());
-        let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        let granule = vm.ipa_granule();
-        let size = granule as usize;
-        let ipa = 0x4000_0000;
-
-        // Misaligned host address, IPA and size are caught before the call.
-        // SAFETY: the checks fail before anything is mapped.
-        let e = unsafe { vm.map(mem.ptr.wrapping_add(1), ipa, size, MemoryFlags::RW) };
-        assert!(matches!(
-            e,
-            Err(Error::Misaligned {
-                what: "host address",
-                ..
-            })
-        ));
-        // SAFETY: as above.
-        let e = unsafe { vm.map(mem.ptr, ipa + 1, size, MemoryFlags::RW) };
-        assert!(matches!(e, Err(Error::Misaligned { what: "ipa", .. })));
-        // SAFETY: as above.
-        let e = unsafe { vm.map(mem.ptr, ipa, size + 1, MemoryFlags::RW) };
-        assert!(matches!(e, Err(Error::Misaligned { what: "size", .. })));
-        // SAFETY: as above.
-        let e = unsafe { vm.map(mem.ptr, 1 << vm.ipa_bits(), size, MemoryFlags::RW) };
-        assert!(matches!(e, Err(Error::OutOfRange { .. })));
-
-        // SAFETY: `mem` outlives `vm`, and the host does not access it.
-        unsafe { vm.map(mem.ptr, ipa, 2 * size, MemoryFlags::RW) }.unwrap();
-        // Mapping over a mapping fails in the framework.
-        // SAFETY: as above.
-        let e = unsafe { vm.map(mem.ptr, ipa, size, MemoryFlags::RW) }.unwrap_err();
-        assert!(
-            matches!(
-                e,
-                Error::Hv {
-                    call: "hv_vm_map",
-                    ..
-                }
-            ),
-            "{e:?}"
-        );
-
-        vm.protect(ipa, size, MemoryFlags::READ).unwrap();
-        vm.unmap(ipa, 2 * size).unwrap();
-        let e = vm.protect(ipa, size, MemoryFlags::READ).unwrap_err();
-        assert!(
-            matches!(
-                e,
-                Error::Hv {
-                    call: "hv_vm_protect",
-                    ..
-                }
-            ),
-            "{e:?}"
-        );
-        assert!(matches!(
-            vm.unmap(ipa, 0),
-            Err(Error::OutOfRange { value: 0, .. })
-        ));
-
-        // Remapping after the unmap works.
-        // SAFETY: as above.
-        unsafe { vm.map(mem.ptr, ipa, size, MemoryFlags::RWX) }.unwrap();
-        drop(vm);
-    }
-
     #[test]
     fn test_slot_states() {
         let Some(_g) = hv_test_lock() else { return };
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_FREE);
+        assert_eq!(*slot_state(), SlotState::Free);
 
         // An unused claim frees the slot again.
         let slot = VmSlot::claim().unwrap();
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_LIVE);
+        assert_eq!(*slot_state(), SlotState::Live);
         assert_eq!(VmSlot::claim().unwrap_err(), Error::VmExists);
         drop(slot);
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_FREE);
+        assert_eq!(*slot_state(), SlotState::Free);
 
         // A zombie slot without a VM (the framework already destroyed it) is
         // recovered by the next claim.
-        VM_STATE.store(VM_ZOMBIE, Ordering::Release);
+        *slot_state() = SlotState::Zombie;
         let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_LIVE);
+        assert_eq!(*slot_state(), SlotState::Live);
         assert_eq!(
             Hvf::create_vm(&VmConfig::default()).unwrap_err(),
             Error::VmExists
@@ -526,9 +421,9 @@ mod tests {
         // Every handle keeps the VM alive.
         let clone = vm.clone();
         drop(vm);
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_LIVE);
+        assert_eq!(*slot_state(), SlotState::Live);
         drop(clone);
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_FREE);
+        assert_eq!(*slot_state(), SlotState::Free);
     }
 
     #[test]
@@ -537,8 +432,8 @@ mod tests {
         let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
 
         // A vCPU created behind the crate's back keeps `hv_vm_destroy`
-        // failing with `HV_BUSY` while its thread lives. When the thread
-        // exits, the framework destroys it asynchronously.
+        // failing with `HV_BUSY` while its thread lives. `hv_vm_destroy`
+        // succeeds once that thread has exited.
         let (created_tx, created_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = thread::spawn(move || {
@@ -554,14 +449,14 @@ mod tests {
 
         // The destroy of the last handle fails and leaves a zombie slot.
         drop(vm);
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_ZOMBIE);
+        assert_eq!(*slot_state(), SlotState::Zombie);
         // The next creation retries the destroy, which still fails.
         let e = Hvf::create_vm(&VmConfig::default()).unwrap_err();
         assert!(
             matches!(e, Error::Hv { call: "hv_vm_destroy", err } if err.is_busy()),
             "{e:?}"
         );
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_ZOMBIE);
+        assert_eq!(*slot_state(), SlotState::Zombie);
 
         // Once the thread is gone, creation recovers the slot.
         release_tx.send(()).unwrap();
@@ -576,9 +471,9 @@ mod tests {
                 Err(e) => panic!("unexpected error: {e:?}"),
             }
         };
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_LIVE);
+        assert_eq!(*slot_state(), SlotState::Live);
         drop(vm);
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_FREE);
+        assert_eq!(*slot_state(), SlotState::Free);
     }
 
     #[test]
@@ -600,9 +495,9 @@ mod tests {
         rx.recv().unwrap();
         drop(vm);
         // The vCPU on the other thread still holds the VM.
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_LIVE);
+        assert_eq!(*slot_state(), SlotState::Live);
         done_tx.send(()).unwrap();
         handle.join().unwrap();
-        assert_eq!(VM_STATE.load(Ordering::Acquire), VM_FREE);
+        assert_eq!(*slot_state(), SlotState::Free);
     }
 }
