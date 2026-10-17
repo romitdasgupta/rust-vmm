@@ -217,7 +217,6 @@ pub(crate) struct Topology {
     /// At least one vCPU was created.
     pub(crate) vcpu_created: bool,
     /// The in-kernel GIC was created.
-    #[allow(dead_code)]
     pub(crate) gic: bool,
 }
 

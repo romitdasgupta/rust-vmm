@@ -65,8 +65,7 @@ pub struct Vcpu {
     pub(crate) shared: Arc<VcpuShared>,
     /// Keeps the VM alive while the vCPU exists. Dropped after `Drop::drop`
     /// destroyed the vCPU.
-    #[allow(dead_code)]
-    pub(crate) vm: Arc<VmInner>,
+    pub(crate) _vm: Arc<VmInner>,
     pub(crate) _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -176,7 +175,7 @@ impl Vcpu {
             id,
             exit,
             shared,
-            vm,
+            _vm: vm,
             _not_send_sync: PhantomData,
         })
     }

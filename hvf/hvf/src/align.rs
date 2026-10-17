@@ -6,7 +6,10 @@
 
 // The callers are only compiled on macOS/aarch64; the checks are tested on
 // every target.
-#![allow(dead_code)]
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 
 use crate::error::{Error, Result};
 use crate::gic_types::{GicConfig, GicParams};
