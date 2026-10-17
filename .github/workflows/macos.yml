@@ -36,7 +36,7 @@ jobs:
 
     - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
       run: |
-        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target x86_64-apple-darwin
         rustup default "$RUST_TOOLCHAIN"
         rustc --version
         xcrun --show-sdk-version
@@ -54,6 +54,11 @@ jobs:
 
     - name: Clippy (hvf crates, all features)
       run: cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
+
+    # Intel Macs get the types and constants of hvf-bindings, so make sure
+    # the hvf crates also build without warnings there.
+    - name: Clippy (hvf crates, x86_64-apple-darwin)
+      run: cargo clippy -p hvf-bindings -p hvf --all-targets --all-features --target x86_64-apple-darwin -- -D warnings -D clippy::undocumented_unsafe_blocks
 
     - name: Test the workspace
       run: cargo test --workspace

@@ -32,7 +32,8 @@ use std::process::Command;
 use hvf_bindings::*;
 
 /// The name of the SIMD setter, which is reached through a trampoline and
-/// therefore has no `hv_fns!` entry.
+/// therefore has no `hv_fns!` entry. Functions are only bound on aarch64.
+#[cfg(target_arch = "aarch64")]
 const SIMD_SETTER: &str = "hv_vcpu_set_simd_fp_reg";
 
 struct Sdk {
