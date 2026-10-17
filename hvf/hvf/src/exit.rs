@@ -200,9 +200,14 @@ pub enum ExceptionClass {
 }
 
 impl ExceptionClass {
-    /// Whether the hardware already advanced the PC past the trapping
-    /// instruction. Only true for [`ExceptionClass::Hvc`]; for every other
-    /// class the VMM advances the PC itself after emulation.
+    /// Whether the PC was already past the trapping instruction when
+    /// `Vcpu::run` returned. Only true for [`ExceptionClass::Hvc`].
+    ///
+    /// For the other classes the PC points at the instruction. After
+    /// emulating it, call `Vcpu::advance_pc`, except after
+    /// `Vcpu::complete_mmio_read` or `Vcpu::complete_mmio_write`, which
+    /// advance it themselves. An abort resolved by letting the guest retry
+    /// the access (after `Vm::protect` or `Vm::map`) must not be advanced.
     pub fn pc_advanced_by_hw(&self) -> bool {
         matches!(self, ExceptionClass::Hvc { .. })
     }

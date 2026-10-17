@@ -402,11 +402,28 @@ impl Vcpu {
         Reg::x(n).ok_or(Error::InvalidRegister(u32::from(n)))
     }
 
+    /// Completes an MMIO store described by `syndrome`: returns the value the
+    /// guest stores (the transfer register, 0 for `XZR`, masked to the access
+    /// size) and advances the PC. The caller performs the store with the
+    /// returned value.
+    ///
+    /// This is the store counterpart of
+    /// [`complete_mmio_read`](Self::complete_mmio_read): after either one,
+    /// do not call [`advance_pc`](Self::advance_pc). On error the PC is
+    /// left at the store.
+    pub fn complete_mmio_write(&mut self, syndrome: &DataAbortSyndrome) -> Result<u64> {
+        let value = self.mmio_write_value(syndrome)?;
+        self.advance_pc()?;
+        Ok(value)
+    }
+
     /// The value an MMIO store described by `syndrome` writes: the transfer
     /// register (0 for `XZR`) masked to the access size.
     ///
-    /// The caller performs the store and then calls
-    /// [`advance_pc`](Self::advance_pc).
+    /// Unlike [`complete_mmio_write`](Self::complete_mmio_write), this does
+    /// not advance the PC: the caller performs the store and then calls
+    /// [`advance_pc`](Self::advance_pc). Forgetting to makes the guest
+    /// repeat the store forever.
     pub fn mmio_write_value(&self, syndrome: &DataAbortSyndrome) -> Result<u64> {
         let reg = match syndrome.srt {
             XZR => 0,
@@ -617,6 +634,21 @@ mod tests {
             vcpu.mmio_write_value(&syndrome(8, 32, false, true)),
             Err(Error::InvalidRegister(32))
         );
+
+        // `complete_mmio_write` returns the same value and advances the PC,
+        // like `complete_mmio_read`; on error it leaves the PC alone.
+        vcpu.set_reg(Reg::PC, 0x2000).unwrap();
+        assert_eq!(
+            vcpu.complete_mmio_write(&syndrome(4, 3, false, true))
+                .unwrap(),
+            0x5566_7788
+        );
+        assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), 0x2004);
+        assert_eq!(
+            vcpu.complete_mmio_write(&syndrome(8, 32, false, true)),
+            Err(Error::InvalidRegister(32))
+        );
+        assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), 0x2004);
 
         vcpu.set_reg(Reg::PC, 0x1000).unwrap();
         vcpu.complete_mmio_read(&syndrome(1, 4, true, true), 0x80)

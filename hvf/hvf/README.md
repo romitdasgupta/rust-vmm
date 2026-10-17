@@ -253,14 +253,18 @@ The `hv_vm_allocate` allocator is not wrapped. Use `mmap` or vm-memory.
 VMM. `Exception::decode()` turns the syndrome into an `ExceptionClass`. Apart
 from `HVC`, the PC still points at the trapping instruction when `run`
 returns. The VMM must call `Vcpu::advance_pc()` after emulating the
-instruction. `ExceptionClass::pc_advanced_by_hw()` reports which case applies.
+instruction, except after `Vcpu::complete_mmio_read` and
+`Vcpu::complete_mmio_write`, which advance it themselves. An abort resolved
+by letting the guest retry (after `Vm::protect` or `Vm::map`) must not be
+advanced. `ExceptionClass::pc_advanced_by_hw()` reports whether the PC has
+already moved on.
 
 | Exit | PC on exit | VMM action |
 |---|---|---|
 | `Hvc { imm }` | already past the `hvc` | emulate (PSCI, hypercall); **do not** advance |
 | `Smc { imm }` | at the `smc` | emulate, then `advance_pc` |
 | `SysReg(access)` | at the `mrs`/`msr` | emulate, then `advance_pc` |
-| `DataAbort(abort)` (MMIO) | at the load or store | `mmio_write_value` + `advance_pc`, or `complete_mmio_read` |
+| `DataAbort(abort)` (MMIO) | at the load or store | `complete_mmio_write` or `complete_mmio_read` (both advance the PC) |
 | `Wfx { wfe }` | at the `wfi`/`wfe` | wait (see below), then `advance_pc` |
 | `WfxTimeout { wfe, timeout_reg }` | at the `wfit`/`wfet` | wait, at most until the deadline in `timeout_reg`, then `advance_pc` |
 | `InstructionAbort`, `Breakpoint`, `SoftwareStep`, `Watchpoint`, `Brk` | at the instruction | VMM-specific |
@@ -279,15 +283,16 @@ syndrome is valid (`abort.syndrome` is `Some`):
 ```rust
 let access = abort.syndrome.expect("ISV=0: decode the instruction yourself");
 if abort.write {
-    let value = vcpu.mmio_write_value(&access)?; // Rt masked to access.len bytes
+    let value = vcpu.complete_mmio_write(&access)?; // Rt masked to access.len bytes, advances PC
     bus.write(abort.ipa, &value.to_le_bytes()[..usize::from(access.len)]);
-    vcpu.advance_pc()?;
 } else {
     let raw = bus.read(abort.ipa, usize::from(access.len));
     vcpu.complete_mmio_read(&access, raw)?; // sign/zero extends, writes Rt, advances PC
 }
 ```
 
+`Vcpu::mmio_write_value` returns the store value without advancing the PC,
+for a VMM that wants to advance it only once the store succeeded.
 `hvf::mmio_load_value` and `hvf::mmio_store_value` provide the same
 arithmetic without a vCPU.
 
