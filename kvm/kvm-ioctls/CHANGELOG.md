@@ -6,7 +6,7 @@
 
 - The crate is now empty on non-Linux targets (it is gated on
   `target_os = "linux"` or `"android"`), so workspaces that also build for
-  macOS keep compiling. The crate-level doctest is ignored on Apple targets.
+  macOS keep compiling.
 
 ## v0.25.1
 
