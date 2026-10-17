@@ -9,6 +9,7 @@
 //! - [`psci`]: CPU power management and system power off over `HVC`.
 //! - [`sysreg`]: the system registers the framework traps.
 //! - [`cpu`]: vCPU threads and their exit loop.
+//! - [`input`]: the console input thread and the `Ctrl-A` escape.
 //!
 //! The in-kernel GICv3 of macOS 15 provides the interrupt controller, the
 //! timer interrupts and `WFI` handling, so the VMM needs no interrupt
@@ -18,6 +19,7 @@ pub mod layout;
 
 mod cpu;
 mod fdt;
+mod input;
 mod pl011;
 mod psci;
 mod sysreg;
@@ -28,6 +30,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::ops::ControlFlow;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -79,8 +83,10 @@ pub struct Config {
     /// Where the console output goes.
     pub output: Box<dyn Write + Send>,
     /// Where console input comes from. `Ctrl-A x` in the input stops the
-    /// VMM; `Ctrl-A Ctrl-A` sends a `Ctrl-A`.
-    pub input: Option<Box<dyn Read + Send>>,
+    /// VMM; `Ctrl-A Ctrl-A` sends a `Ctrl-A`. It is read by a thread that
+    /// [`run`] stops before it returns, so a later `run` can use (a
+    /// duplicate of) the same input without losing anything.
+    pub input: Option<OwnedFd>,
     /// The terminal is in raw mode, so log lines end with `\r\n`.
     pub raw_terminal: bool,
 }
@@ -356,47 +362,35 @@ fn create_vm(ipa_bits: Option<u32>) -> Result<Vm> {
 }
 
 /// Forwards console input to the UART, and stops the machine on `Ctrl-A x`.
-fn spawn_input(machine: Weak<Machine>, mut input: Box<dyn Read + Send>) -> Result<()> {
-    const CTRL_A: u8 = 0x01;
-    thread::Builder::new()
-        .name("console-input".into())
-        .spawn(move || {
-            let mut buf = [0u8; 256];
-            let mut escape = false;
-            loop {
-                let n = match input.read(&mut buf) {
-                    Ok(0) => return,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return,
-                };
-                let Some(machine) = machine.upgrade() else {
-                    return;
-                };
-                let mut bytes = Vec::with_capacity(n);
-                for &b in &buf[..n] {
-                    if escape {
-                        escape = false;
-                        match b {
-                            b'x' | b'X' => {
-                                // Not through the UART, so a guest or an
-                                // output that is stuck cannot delay it.
-                                machine.shutdown(Outcome::Quit);
-                                return;
-                            }
-                            CTRL_A => bytes.push(CTRL_A),
-                            _ => bytes.extend_from_slice(&[CTRL_A, b]),
-                        }
-                    } else if b == CTRL_A {
-                        escape = true;
-                    } else {
-                        bytes.push(b);
-                    }
-                }
-                machine.console.receive(&bytes);
+/// The thread stops when the returned value is dropped.
+fn spawn_input(machine: Weak<Machine>, input: OwnedFd) -> Result<input::InputThread> {
+    let mut escape = input::Escape::default();
+    let log_machine = machine.clone();
+    Ok(input::InputThread::spawn(
+        input,
+        move |bytes| {
+            let Some(machine) = machine.upgrade() else {
+                return ControlFlow::Break(());
+            };
+            let mut guest = Vec::with_capacity(bytes.len());
+            let quit = escape.filter(bytes, &mut guest);
+            machine.console.receive(&guest);
+            if quit {
+                // Not through the UART, so a guest or an output that is
+                // stuck cannot delay it.
+                machine.shutdown(Outcome::Quit);
+                return ControlFlow::Break(());
             }
-        })?;
-    Ok(())
+            ControlFlow::Continue(())
+        },
+        move |e| {
+            if let Some(machine) = log_machine.upgrade() {
+                machine.log.print(format_args!(
+                    "console input closed ({e}); Ctrl-A x is unavailable"
+                ));
+            }
+        },
+    )?)
 }
 
 /// Boots the kernel and runs the guest until it powers off or resets.
@@ -522,9 +516,11 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         warned: WarnOnce::default(),
         log,
     });
-    if let Some(input) = cfg.input {
-        spawn_input(Arc::downgrade(&machine), input)?;
-    }
+    // Stopped and joined when dropped, before `run` returns.
+    let input = match cfg.input {
+        Some(input) => Some(spawn_input(Arc::downgrade(&machine), input)?),
+        None => None,
+    };
 
     let gate = Arc::new(cpu::StartGate::new(cfg.cpus));
     let mut threads = Vec::with_capacity(cfg.cpus);
@@ -550,6 +546,9 @@ pub fn run(cfg: Config) -> Result<Outcome> {
             machine.fail(format!("vCPU {index} panicked"));
         }
     }
+    // Before the machine goes, so that the input thread does not hold the
+    // last reference to it.
+    drop(input);
 
     let outcome = machine
         .outcome

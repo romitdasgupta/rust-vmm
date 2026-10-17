@@ -751,5 +751,6 @@ If the run needs no shell, boot with `hvf.autopoweroff` (see
 `/init` instead.
 
 **The terminal behaves oddly after the VMM was killed.** The VMM restores
-the terminal when it exits normally, but not after `kill -9`. Type `reset`
-(or `stty sane`) and press Enter.
+the terminal when it exits, and also when `SIGTERM`, `SIGHUP`, `SIGINT` or
+`SIGQUIT` ends it, but nothing can after `kill -9` (`SIGKILL`). Type
+`reset` (or `stty sane`) and press Enter.

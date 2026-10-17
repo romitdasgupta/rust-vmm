@@ -30,7 +30,9 @@ mod vmm;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cli {
     use std::io::Write;
+    use std::os::fd::AsFd;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
 
     use super::vmm::{self, Config, Outcome};
 
@@ -120,8 +122,47 @@ Ctrl-A x stops the VMM.";
         Ok(Some(parsed))
     }
 
+    /// The terminal settings to restore, for the signal handler.
+    static SAVED: OnceLock<libc::termios> = OnceLock::new();
+
+    /// Signals that would otherwise end the process with the terminal left
+    /// in raw mode. With raw mode, the keyboard sends none of them; they
+    /// come from `kill` or a closed terminal.
+    const RESTORE_ON: [libc::c_int; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+
+    /// Restores the terminal, then dies of `signal` as if unhandled.
+    extern "C" fn restore_and_die(signal: libc::c_int) {
+        if let Some(saved) = SAVED.get() {
+            // SAFETY: `tcsetattr`, `signal` and `raise` are
+            // async-signal-safe, and `saved` is a valid `termios` that is
+            // never modified after it is set.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
+        }
+        // SAFETY: as above.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// Clears a stale `O_NONBLOCK` on stdin, left by another program on the
+    /// same terminal. Stdout usually shares it, and the console output would
+    /// then fail with `EAGAIN` and lose bytes.
+    fn make_stdin_blocking() {
+        // SAFETY: `fcntl` with `F_GETFL`/`F_SETFL` only reads and changes
+        // the file status flags of stdin.
+        unsafe {
+            let flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
+            if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+                libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+    }
+
     /// Puts the terminal on stdin into raw mode while it lives, so that
-    /// keys reach the guest unprocessed (`Ctrl-C` included).
+    /// keys reach the guest unprocessed (`Ctrl-C` included). The terminal
+    /// is also restored if a signal such as `SIGTERM` or `SIGHUP` ends the
+    /// process; only `SIGKILL` leaves it raw.
     struct RawTerminal {
         saved: libc::termios,
     }
@@ -139,6 +180,19 @@ Ctrl-A x stops the VMM.";
             // SAFETY: `saved` is a valid, writable `termios`.
             if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
                 return None;
+            }
+            // `main` enables raw mode once, so this is the first `set`.
+            if SAVED.set(saved).is_ok() {
+                for signal in RESTORE_ON {
+                    // SAFETY: `restore_and_die` is an `extern "C"` handler
+                    // that only makes async-signal-safe calls.
+                    unsafe {
+                        libc::signal(
+                            signal,
+                            restore_and_die as extern "C" fn(libc::c_int) as libc::sighandler_t,
+                        )
+                    };
+                }
             }
             let mut raw = saved;
             // SAFETY: `raw` is a valid `termios`; `cfmakeraw` only changes
@@ -173,6 +227,7 @@ Ctrl-A x stops the VMM.";
             }
         };
 
+        make_stdin_blocking();
         let raw = RawTerminal::enable();
         let result = vmm::run(Config {
             kernel: args.kernel,
@@ -182,7 +237,13 @@ Ctrl-A x stops the VMM.";
             cpus: args.cpus,
             verbose: args.verbose,
             output: Box::new(std::io::stdout()),
-            input: Some(Box::new(std::io::stdin())),
+            input: match std::io::stdin().as_fd().try_clone_to_owned() {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    let _ = writeln!(std::io::stderr(), "boot_linux: no console input: {e}");
+                    None
+                }
+            },
             raw_terminal: raw.is_some(),
         });
         drop(raw);
