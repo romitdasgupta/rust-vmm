@@ -11,26 +11,9 @@ use hvf_bindings::{
 };
 
 /// `errno` values of the host, used by [`HvError::to_errno`].
+#[cfg(any(unix, windows, target_os = "wasi"))]
 mod errno {
-    #[cfg(target_os = "macos")]
     pub(super) use libc::{EBUSY, EEXIST, EINVAL, EIO, ENODEV, ENOMEM, ENOTSUP, EPERM};
-
-    // `libc` is only a dependency on macOS. These are the Linux values, which
-    // is where the portable part of the crate is built and tested otherwise.
-    // All but `ENOTSUP` are the same on every Unix.
-    #[cfg(not(target_os = "macos"))]
-    mod values {
-        pub const EPERM: i32 = 1;
-        pub const EIO: i32 = 5;
-        pub const ENOMEM: i32 = 12;
-        pub const EBUSY: i32 = 16;
-        pub const EEXIST: i32 = 17;
-        pub const ENODEV: i32 = 19;
-        pub const EINVAL: i32 = 22;
-        pub const ENOTSUP: i32 = 95;
-    }
-    #[cfg(not(target_os = "macos"))]
-    pub(super) use values::*;
 }
 
 /// A non-success `hv_return_t` returned by Hypervisor.framework.
@@ -78,6 +61,9 @@ impl HvError {
     /// `HV_UNSUPPORTED` to `ENOTSUP`, `HV_NO_RESOURCES` to `ENOMEM`,
     /// `HV_NO_DEVICE` to `ENODEV`, `HV_EXISTS` to `EEXIST` and everything else
     /// to `EIO`.
+    ///
+    /// Only on targets with `errno` values (Unix, Windows and WASI).
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     pub fn to_errno(&self) -> i32 {
         match self.0 {
             HV_BUSY => errno::EBUSY,
@@ -360,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(unix, windows, target_os = "wasi"))]
     fn test_to_errno() {
         let cases = [
             (HV_BUSY, errno::EBUSY),
@@ -379,9 +366,10 @@ mod tests {
         // Spot-check the host values.
         assert_eq!(HvError(HV_BUSY).to_errno(), 16);
         assert_eq!(HvError(HV_BAD_ARGUMENT).to_errno(), 22);
+        assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), libc::ENOTSUP);
         #[cfg(target_os = "macos")]
         assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), 45);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         assert_eq!(HvError(HV_UNSUPPORTED).to_errno(), 95);
     }
 
