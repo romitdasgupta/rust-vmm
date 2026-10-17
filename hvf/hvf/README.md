@@ -150,10 +150,13 @@ with the `com.apple.security.hypervisor` entitlement. Without it,
 codesign --sign - --force --entitlements hvf/scripts/hvf.entitlements <binary>
 ```
 
-In this repository, `cargo test`, `cargo run` and doctests sign their
-binaries automatically. `.cargo/config.toml` sets
+In this repository, `cargo test` and `cargo run` sign their binaries
+automatically. `.cargo/config.toml` sets
 [`hvf/scripts/codesign-run.sh`](../scripts/codesign-run.sh) as the runner for
-`aarch64-apple-darwin`.
+`aarch64-apple-darwin`. Doctests are signed too with Rust 1.89 or newer: older
+Cargo does not pass the runner to rustdoc, so with Rust 1.88 doctests run
+unsigned and the ones that create a VM take their "hypervisor unavailable"
+path.
 
 The host probes (`Hvf::max_vcpu_count`, `max_ipa_bits`, `default_ipa_bits`,
 `el2_supported`, `default_ipa_granule`, `sme_max_svl_bytes`, `gic_params`,
@@ -372,12 +375,20 @@ called (alignment, IPA range, overlap, MSI range inside the SPI range).
 Tests that create a VM need a host where `kern.hv_support` is 1, and a signed
 binary. In this repository the runner takes care of signing. On hosts without
 HVF, such as Linux, GitHub-hosted macOS runners or unsigned binaries, these
-tests print `SKIP` and pass. Set `HVF_REQUIRE=1` to make a skip fail:
+tests print `SKIP` and pass. Set `HVF_REQUIRE=1` to make the unit and
+integration tests fail instead when the hypervisor is not usable (no
+`kern.hv_support`, unsigned binary):
 
 ```sh
 HVF_REQUIRE=1 cargo test -p hvf --all-features
 HVF_REQUIRE=1 cargo test -p hvf --all-features --release
 ```
+
+`HVF_REQUIRE` does not cover features the host lacks: the GIC tests skip
+before macOS 15.0, the EL2 tests on chips older than M3, and the 4 KiB
+granule tests before macOS 26.0, whatever `HVF_REQUIRE` says. Check the
+macOS version and the chip (`sw_vers`, `sysctl machdep.cpu.brand_string`)
+to know which of them ran.
 
 To check the skip path on a Mac, rebuild with the runner replaced by `env`.
 Rebuild first (`cargo clean -p hvf`), because `codesign` signs binaries in
