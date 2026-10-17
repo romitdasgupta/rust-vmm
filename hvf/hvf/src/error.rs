@@ -61,9 +61,14 @@ impl HvError {
         self.0 == HV_BAD_ARGUMENT
     }
 
-    /// Whether the error means the hypervisor cannot be used at all on this
-    /// host or by this binary: `HV_DENIED`, `HV_UNSUPPORTED` or
-    /// `HV_NO_DEVICE`.
+    /// `HV_DENIED`, `HV_UNSUPPORTED` or `HV_NO_DEVICE`: when `hv_vm_create`
+    /// returns one of them, the hypervisor cannot be used on this host or by
+    /// this binary.
+    ///
+    /// Only meaningful for `hv_vm_create`. Other calls return
+    /// `HV_UNSUPPORTED` or `HV_NO_DEVICE` for configuration errors on a
+    /// working host: an IPA size above the maximum, a GIC call on a VM
+    /// without a GIC, or `Vcpu::wfi_time` without a GIC. Prefer [`Error::is_unavailable`], which checks the call.
     pub fn is_unavailable(&self) -> bool {
         matches!(self.0, HV_DENIED | HV_UNSUPPORTED | HV_NO_DEVICE)
     }
@@ -112,7 +117,7 @@ impl HvError {
             ),
             HV_ILLEGAL_GUEST_STATE => ("HV_ILLEGAL_GUEST_STATE", "illegal guest state"),
             HV_NO_RESOURCES => ("HV_NO_RESOURCES", "out of resources"),
-            HV_NO_DEVICE => ("HV_NO_DEVICE", "no hypervisor device"),
+            HV_NO_DEVICE => ("HV_NO_DEVICE", "no such device (no VM or no GIC)"),
             HV_DENIED => ("HV_DENIED", "binary lacks com.apple.security.hypervisor"),
             HV_EXISTS => ("HV_EXISTS", "already exists"),
             HV_UNSUPPORTED => ("HV_UNSUPPORTED", "operation not supported"),
@@ -195,6 +200,21 @@ pub enum Error {
     InvalidRegister(u32),
     /// A `*_create()` function returned a null object.
     NullObject(&'static str),
+}
+
+impl Error {
+    /// Whether `Hvf::create_vm` failed because Hypervisor.framework cannot be
+    /// used on this host or by this binary: `hv_vm_create` returned
+    /// `HV_DENIED` (the binary lacks the `com.apple.security.hypervisor`
+    /// entitlement), `HV_UNSUPPORTED` or `HV_NO_DEVICE` (Intel Mac, or a VM
+    /// without nested virtualization).
+    ///
+    /// False for every other error, including the `HV_UNSUPPORTED` and
+    /// `HV_NO_DEVICE` that other calls return for configuration errors (see
+    /// [`HvError::is_unavailable`]).
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Error::Hv { call: "hv_vm_create", err } if err.is_unavailable())
+    }
 }
 
 impl fmt::Display for Error {
@@ -297,6 +317,37 @@ mod tests {
                 [HV_DENIED, HV_UNSUPPORTED, HV_NO_DEVICE].contains(&code)
             );
         }
+    }
+
+    #[test]
+    fn test_error_is_unavailable() {
+        let hv = |call, code| Error::Hv {
+            call,
+            err: HvError(code),
+        };
+        for code in [HV_DENIED, HV_UNSUPPORTED, HV_NO_DEVICE] {
+            assert!(hv("hv_vm_create", code).is_unavailable(), "{code:#x}");
+        }
+        for code in [HV_BUSY, HV_ERROR, HV_BAD_ARGUMENT, HV_NO_RESOURCES] {
+            assert!(!hv("hv_vm_create", code).is_unavailable(), "{code:#x}");
+        }
+        // Configuration errors on a working host, not an unusable hypervisor.
+        for (call, code) in [
+            ("hv_vm_config_set_ipa_size", HV_UNSUPPORTED),
+            ("hv_gic_get_redistributor_base", HV_NO_DEVICE),
+            ("hv_vcpu_get_wait_for_interrupt_time", HV_UNSUPPORTED),
+            ("hv_vcpu_set_pending_interrupt", HV_UNSUPPORTED),
+        ] {
+            assert!(!hv(call, code).is_unavailable(), "{call}");
+        }
+        assert!(
+            !Error::Unavailable {
+                api: "hv_gic_create",
+                since: (15, 0),
+            }
+            .is_unavailable()
+        );
+        assert!(!Error::VmExists.is_unavailable());
     }
 
     #[test]

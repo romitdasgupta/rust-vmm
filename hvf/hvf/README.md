@@ -160,9 +160,14 @@ The host probes (`Hvf::max_vcpu_count`, `max_ipa_bits`, `default_ipa_bits`,
 `gic_intid`) and `VcpuConfig` need neither the entitlement nor an existing VM.
 They return the same values in unsigned binaries.
 
-`HvError::is_unavailable()` is true for `HV_DENIED`, `HV_UNSUPPORTED` and
-`HV_NO_DEVICE`. Use it to tell "hypervisor not usable here" (unsigned binary,
-Intel Mac, VM without nested virtualization) apart from real failures.
+`Error::is_unavailable()` is true when `hv_vm_create` failed with
+`HV_DENIED`, `HV_UNSUPPORTED` or `HV_NO_DEVICE`. Use it on the result of
+`Hvf::create_vm` to tell "hypervisor not usable here" (unsigned binary, Intel
+Mac, VM without nested virtualization) apart from real failures. Other calls
+return `HV_UNSUPPORTED` or `HV_NO_DEVICE` for configuration errors on a
+working host (an IPA size above the maximum, GIC calls on a VM without a GIC,
+`Vcpu::wfi_time` without a GIC), so do not apply
+`HvError::is_unavailable()`, which only looks at the code, to them.
 `Hvf::is_supported()` reads `kern.hv_support` and does not look at the
 entitlement.
 

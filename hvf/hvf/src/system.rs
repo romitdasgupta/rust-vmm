@@ -216,7 +216,7 @@ impl Hvf {
     ///
     /// The binary must be signed with the `com.apple.security.hypervisor`
     /// entitlement, otherwise this fails with `HV_DENIED`
-    /// ([`HvError::is_unavailable`](crate::HvError::is_unavailable)).
+    /// ([`Error::is_unavailable`](crate::Error::is_unavailable)).
     ///
     /// If the previous VM could not be destroyed when its last handle was
     /// dropped (for example because a vCPU leaked on an exiting thread was
@@ -458,7 +458,7 @@ pub(crate) mod tests {
         } else {
             match Hvf::create_vm(&VmConfig::default()) {
                 Ok(_) => return Some(guard),
-                Err(Error::Hv { err, .. }) if err.is_unavailable() => err.to_string(),
+                Err(e) if e.is_unavailable() => e.to_string(),
                 Err(e) => panic!("cannot create a VM: {e}"),
             }
         };
