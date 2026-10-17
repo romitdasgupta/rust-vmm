@@ -67,7 +67,18 @@ impl TempFile {
     fn new(size: usize) -> TempFile {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("hvf-memory-{}-{n}", std::process::id()));
+        TempFile::create(
+            std::env::temp_dir().join(format!("hvf-memory-{}-{n}", std::process::id())),
+            size,
+        )
+    }
+
+    /// Creates the file at `path`, which is named after this process.
+    fn create(path: PathBuf, size: usize) -> TempFile {
+        // A file with this live process's name can only have been left
+        // behind by an earlier process with the same pid that died without
+        // unwinding (SIGKILL, abort).
+        let _ = std::fs::remove_file(&path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -93,6 +104,19 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Regression test for A5-7: a file left behind by a killed run whose pid
+/// this run reuses does not make the file-mapping tests fail.
+#[test]
+fn test_temp_file_replaces_stale_file() {
+    let path = std::env::temp_dir().join(format!("hvf-memory-{}-stale", std::process::id()));
+    std::fs::write(&path, b"stale").unwrap();
+    let file = TempFile::create(path.clone(), 0x4000);
+    assert_eq!(file.file.metadata().unwrap().len(), 0x4000);
+    assert_eq!(file.pread_u32(0), 0);
+    drop(file);
+    assert!(!path.exists());
 }
 
 /// Creates a vCPU that starts at `GUEST_IPA` with `x0 = value` and
