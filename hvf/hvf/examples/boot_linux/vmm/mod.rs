@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, PoisonError, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hvf::{GicConfig, GicIntid, Hvf, MemoryFlags, Vcpu, VcpuKicker, Vm, VmConfig};
 use linux_loader::cmdline::Cmdline;
@@ -41,7 +41,9 @@ use vm_device::bus::{BusRange, MmioAddress};
 use vm_device::device_manager::{IoManager, MmioManager};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use layout::{DTB_MAX_SIZE, GICD_BASE, GICR_BASE, RAM_BASE, SZ_2M, UART_BASE, UART_SIZE, UART_SPI};
+use layout::{
+    DTB_MAX_SIZE, GICD_BASE, GICR_BASE, RAM_BASE, SZ_2M, UART_BASE, UART_INTID, UART_SIZE,
+};
 use pl011::Pl011;
 
 /// The error type of the VMM.
@@ -294,30 +296,62 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-/// Creates the VM.
-fn create_vm() -> Result<Vm> {
-    let start = Instant::now();
-    loop {
-        match Hvf::create_vm(&VmConfig::default()) {
-            Ok(vm) => return Ok(vm),
-            // The previous VM of this process (when `run` is called more
-            // than once) is destroyed once the framework has released its
-            // vCPUs, a few milliseconds after their threads exit.
-            Err(hvf::Error::Hv {
-                call: "hv_vm_destroy",
-                err,
-            }) if err.is_busy() && start.elapsed() < Duration::from_secs(2) => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(hvf::Error::Hv { err, .. }) if err.is_unavailable() => {
-                return Err(format!(
-                    "Hypervisor.framework is unavailable ({err}); is the binary signed with \
-                     the com.apple.security.hypervisor entitlement?"
-                )
-                .into());
-            }
-            Err(e) => return Err(e.into()),
+/// The IPA sizes the framework accepts, smallest first.
+const IPA_SIZES: [u32; 6] = [36, 40, 42, 44, 48, 52];
+
+/// The IPA size for `mem_size` bytes of RAM at [`RAM_BASE`]: `None` (the
+/// framework's default, `default_bits`) when that is enough, otherwise the
+/// smallest larger size up to `max_bits`.
+fn ipa_bits_for(mem_size: u64, default_bits: u32, max_bits: u32) -> Result<Option<u32>> {
+    let too_big = || {
+        let limit = 1u64.checked_shl(max_bits).unwrap_or(u64::MAX);
+        format!(
+            "--mem must be at most {} MiB on this host ({max_bits}-bit IPA)",
+            limit.saturating_sub(RAM_BASE) >> 20
+        )
+    };
+    let last = RAM_BASE.checked_add(mem_size - 1).ok_or_else(too_big)?;
+    let needed = u64::BITS - last.leading_zeros();
+    if needed <= default_bits {
+        return Ok(None);
+    }
+    IPA_SIZES
+        .into_iter()
+        .find(|&bits| bits >= needed && bits <= max_bits)
+        .map(Some)
+        .ok_or_else(|| too_big().into())
+}
+
+/// The IPA size `mem_size` bytes of RAM need on this host.
+fn ipa_bits(mem_size: u64) -> Result<Option<u32>> {
+    match (Hvf::default_ipa_bits(), Hvf::max_ipa_bits()) {
+        (Ok(default), Ok(max)) => ipa_bits_for(mem_size, default, max),
+        // Before macOS 13.0 the IPA size is always 36 bits.
+        (Err(hvf::Error::Unavailable { .. }), _) | (_, Err(hvf::Error::Unavailable { .. })) => {
+            ipa_bits_for(mem_size, 36, 36)
         }
+        (Err(e), _) | (_, Err(e)) => Err(e.into()),
+    }
+}
+
+/// Creates the VM with an IPA size of `ipa_bits` (the default if `None`).
+///
+/// A previous VM of this process (when `run` is called more than once) is
+/// gone by now: its vCPUs were destroyed on their own threads, and the
+/// crate retries `hv_vm_destroy` while the framework finishes releasing
+/// them.
+fn create_vm(ipa_bits: Option<u32>) -> Result<Vm> {
+    match Hvf::create_vm(&VmConfig {
+        ipa_bits,
+        ..Default::default()
+    }) {
+        Ok(vm) => Ok(vm),
+        Err(hvf::Error::Hv { err, .. }) if err.is_unavailable() => Err(format!(
+            "Hypervisor.framework is unavailable ({err}); is the binary signed with the \
+             com.apple.security.hypervisor entitlement?"
+        )
+        .into()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -386,6 +420,14 @@ pub fn run(cfg: Config) -> Result<Outcome> {
     if cfg.mem_size == 0 || !cfg.mem_size.is_multiple_of(SZ_2M) {
         return Err("--mem must be a non-zero multiple of 2 MiB".into());
     }
+    let ipa_bits = ipa_bits(cfg.mem_size)?;
+    if !(params.spi_base..params.spi_base.saturating_add(params.spi_count)).contains(&UART_INTID) {
+        return Err(format!(
+            "the UART's INTID {UART_INTID} is outside the GIC's SPI range ({} SPIs from {})",
+            params.spi_count, params.spi_base
+        )
+        .into());
+    }
 
     // Guest RAM, unmapped from the VM before it is dropped.
     let mem = GuestMemoryMmap::<()>::from_ranges(&[(
@@ -443,7 +485,7 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         log.print(format_args!("cmdline: {cmdline}"));
     }
 
-    let vm = create_vm()?;
+    let vm = create_vm(ipa_bits)?;
     // SAFETY: `mem` stays mapped until it is unmapped from the guest at the
     // end of this function, and the host accesses it only through
     // vm-memory's volatile accessors.
@@ -455,13 +497,12 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         redistributor_base: GICR_BASE,
         msi: None,
     })?);
-    let uart_intid = params.spi_base + UART_SPI;
     let irq_log = log;
     let console = Pl011::new(
         cfg.output,
         Box::new(move |level| {
-            if let Err(e) = gic.set_spi(uart_intid, level) {
-                irq_log.print(format_args!("cannot set SPI {uart_intid}: {e}"));
+            if let Err(e) = gic.set_spi(UART_INTID, level) {
+                irq_log.print(format_args!("cannot set SPI {UART_INTID}: {e}"));
             }
         }),
     )?;
@@ -578,6 +619,25 @@ mod tests {
         assert!(!warned.first(Warning::MmioRead(0x9999)));
         assert!(!warned.first(Warning::MmioWrite(0x1000)));
         assert_eq!(warned.seen.lock().unwrap().len(), WarnOnce::LIMIT);
+    }
+
+    #[test]
+    fn test_ipa_bits_for() {
+        const G: u64 = 1 << 30;
+        // RAM starts at 2 GiB: 62 GiB fit a 36-bit IPA, more need 40 bits.
+        assert_eq!(ipa_bits_for(512 << 20, 36, 40).unwrap(), None);
+        assert_eq!(ipa_bits_for(62 * G, 36, 40).unwrap(), None);
+        assert_eq!(ipa_bits_for(62 * G + SZ_2M, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(64 * G, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(1022 * G, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(1023 * G, 36, 42).unwrap(), Some(42));
+        // A larger default is kept.
+        assert_eq!(ipa_bits_for(64 * G, 40, 40).unwrap(), None);
+        // Too big for the host, or for the address space.
+        let e = ipa_bits_for(64 * G, 36, 36).unwrap_err().to_string();
+        assert!(e.contains("at most 63488 MiB"), "{e}");
+        assert!(ipa_bits_for(1023 * G, 36, 40).is_err());
+        assert!(ipa_bits_for(u64::MAX - SZ_2M + 1, 36, 52).is_err());
     }
 
     #[test]

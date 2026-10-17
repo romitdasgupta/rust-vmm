@@ -24,6 +24,9 @@ pub const UART_BASE: u64 = 0x0900_0000;
 pub const UART_SIZE: u64 = 0x1000;
 /// The PL011's interrupt as a device tree SPI number (INTID 32 + 1).
 pub const UART_SPI: u32 = 1;
+/// The INTID of [`UART_SPI`]: the GIC device tree binding numbers SPIs from
+/// INTID 32, whatever SPI range the GIC reports.
+pub const UART_INTID: u32 = 32 + UART_SPI;
 /// Base of guest RAM.
 pub const RAM_BASE: u64 = 0x8000_0000;
 

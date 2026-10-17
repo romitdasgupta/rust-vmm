@@ -412,7 +412,7 @@ boot_linux --kernel <Image> [--initrd <file>] [--cmdline <args>]
 | `--kernel <Image>` | required | Uncompressed arm64 Linux `Image` |
 | `--initrd <file>` | none | Initramfs, for example a gzip'd newc cpio archive |
 | `--cmdline <args>` | `console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 panic=-1` | Kernel command line; replaces the default entirely |
-| `--mem <size>` | `512M` | RAM size, a multiple of 2 MiB, with an optional `K`, `M` or `G` suffix. A bare number is MiB |
+| `--mem <size>` | `512M` | RAM size, a multiple of 2 MiB, with an optional `K`, `M` or `G` suffix. A bare number is MiB. RAM starts at 2 GiB, so more than 62 GiB needs a larger IPA space than the default 36 bits; the VMM then asks for one, up to the host's maximum (`Hvf::max_ipa_bits`) |
 | `--cpus <n>` | `1` | Number of vCPUs, from 1 to the host's limit, which the error for a too large value names (64 on the Mac this guide was tested on) |
 | `--verbose`, `-v` | off | Log the memory layout, PSCI calls and vCPU power state changes to stderr |
 | `--help`, `-h` | | Print the usage |
