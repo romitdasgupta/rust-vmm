@@ -23,6 +23,9 @@
 # the guest.
 
 set -eu
+# `cd` with a relative path consults an exported CDPATH, and then prints the
+# directory (or fails), which breaks the `$(cd ... && pwd)` lines below.
+unset CDPATH
 
 # --- Pins. To move to a newer busybox, update all of these together. -------
 APK=busybox-static-1.37.0-r31.apk
