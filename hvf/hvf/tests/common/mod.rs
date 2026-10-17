@@ -171,11 +171,6 @@ impl GuestRam {
         self.mem.get_ref::<u32>(offset).unwrap().load()
     }
 
-    /// Reads the 64-bit word at `offset` with a volatile access.
-    pub fn read_u64(&self, offset: usize) -> u64 {
-        self.mem.get_ref::<u64>(offset).unwrap().load()
-    }
-
     /// Removes the guest mapping now, for tests that observe the unmap.
     pub fn unmap(&mut self) -> hvf::Result<()> {
         assert!(self.mapped, "already unmapped");
