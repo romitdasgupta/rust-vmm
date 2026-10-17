@@ -262,6 +262,7 @@ instruction. `ExceptionClass::pc_advanced_by_hw()` reports which case applies.
 | `SysReg(access)` | at the `mrs`/`msr` | emulate, then `advance_pc` |
 | `DataAbort(abort)` (MMIO) | at the load or store | `mmio_write_value` + `advance_pc`, or `complete_mmio_read` |
 | `Wfx { wfe }` | at the `wfi`/`wfe` | wait (see below), then `advance_pc` |
+| `WfxTimeout { wfe, timeout_reg }` | at the `wfit`/`wfet` | wait, at most until the deadline in `timeout_reg`, then `advance_pc` |
 | `InstructionAbort`, `Breakpoint`, `SoftwareStep`, `Watchpoint`, `Brk` | at the instruction | VMM-specific |
 
 The crate does not set `MPIDR_EL1` or `CPSR`. Both start at 0. Set `CPSR`
@@ -302,6 +303,14 @@ an SPI from `Gic::set_spi` on any thread, or an SGI from another vCPU) and
 returns `Canceled` on a kick, with the PC already past the `wfi`.
 
 On macOS 27, `wfe` does not exit in either case.
+
+`wfit` and `wfet` (`FEAT_WFxT`) take a deadline in a register, compared
+against `CNTVCT_EL0`. The framework hides the feature in `ID_AA64ISAR2_EL1`
+by default. Without the in-kernel GIC, a guest that uses `wfit` anyway exits
+with `ExceptionClass::WfxTimeout`: sleep until the earlier of the timer
+deadline and the value of `X[timeout_reg]`. With the in-kernel GIC, `wfit`
+does not exit and the framework was observed to ignore its deadline, so do
+not advertise `FEAT_WFxT` to the guest.
 
 ## Interrupts without the in-kernel GIC
 

@@ -92,9 +92,13 @@ impl Exception {
         // The immediate of HVC, SMC and BRK is ISS[15:0].
         let imm16 = (iss & 0xffff) as u16;
         match self.ec() {
-            EC_WFX => ExceptionClass::Wfx {
-                // ISS.TI[1:0]: bit 0 is set for WFE (and WFET).
+            // ISS.TI[1:0]: 00 WFI, 01 WFE, 10 WFIT, 11 WFET. For WFIT and
+            // WFET, ISS.RV[2] says whether ISS.RN[9:5] names the register
+            // holding the deadline.
+            EC_WFX if iss & 0b10 == 0 => ExceptionClass::Wfx { wfe: iss & 1 != 0 },
+            EC_WFX => ExceptionClass::WfxTimeout {
                 wfe: iss & 1 != 0,
+                timeout_reg: (iss & 0b100 != 0).then_some(((iss >> 5) & 0x1f) as u8),
             },
             EC_HVC64 => ExceptionClass::Hvc { imm: imm16 },
             EC_SMC64 => ExceptionClass::Smc { imm: imm16 },
@@ -128,6 +132,24 @@ pub enum ExceptionClass {
     Wfx {
         /// `true` for `WFE`, `false` for `WFI`.
         wfe: bool,
+    },
+    /// `WFIT` or `WFET` (EC 0x01, `FEAT_WFxT`): wait with a deadline. The
+    /// PC points at the instruction.
+    ///
+    /// The guest should wake by the deadline, the value of the
+    /// `timeout_reg` general purpose register compared against
+    /// `CNTVCT_EL0`, even without an interrupt. The framework hides
+    /// `FEAT_WFxT` in `ID_AA64ISAR2_EL1` by default, but a guest that uses
+    /// the instructions anyway traps here when the VM has no in-kernel GIC.
+    /// With the in-kernel GIC they do not exit, and the framework was
+    /// observed to ignore the deadline, so do not advertise `FEAT_WFxT` to
+    /// such a guest.
+    WfxTimeout {
+        /// `true` for `WFET`, `false` for `WFIT`.
+        wfe: bool,
+        /// The number `n` of the register `Xn` holding the deadline, or
+        /// `None` if the syndrome does not report it (`ISS.RV == 0`).
+        timeout_reg: Option<u8>,
     },
     /// `HVC` (EC 0x16). The PC already points at the next instruction.
     Hvc {
@@ -437,6 +459,42 @@ mod tests {
         assert_eq!(
             exception(0x07e0_0001).decode(),
             ExceptionClass::Wfx { wfe: true }
+        );
+
+        // `wfit x5`, as trapped by Hypervisor.framework on an M5 Pro:
+        // TI = 0b10, RV = 1, RN = 5. It must not decode as a plain `wfi`.
+        let c = exception(0x07e0_00a6).decode();
+        assert_eq!(
+            c,
+            ExceptionClass::WfxTimeout {
+                wfe: false,
+                timeout_reg: Some(5),
+            }
+        );
+        assert!(!c.pc_advanced_by_hw());
+        // `wfit x0`.
+        assert_eq!(
+            exception(0x07e0_0006).decode(),
+            ExceptionClass::WfxTimeout {
+                wfe: false,
+                timeout_reg: Some(0),
+            }
+        );
+        // `wfet x30`.
+        assert_eq!(
+            exception(0x07e0_03c7).decode(),
+            ExceptionClass::WfxTimeout {
+                wfe: true,
+                timeout_reg: Some(30),
+            }
+        );
+        // TI = WFIT without a valid register (RV = 0).
+        assert_eq!(
+            exception(0x07e0_00a2).decode(),
+            ExceptionClass::WfxTimeout {
+                wfe: false,
+                timeout_reg: None,
+            }
         );
 
         // Instruction aborts: level 2 and level 3 translation faults.
