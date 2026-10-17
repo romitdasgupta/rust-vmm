@@ -312,6 +312,36 @@ pub fn kick_after(kicker: VcpuKicker, delay: Duration) -> mpsc::Receiver<hvf::Re
     rx
 }
 
+/// Runs a vCPU whose guest is expected to spin until kicked, kicking it after
+/// 50 ms, and returns the exit.
+///
+/// A kick that lands before [`Vcpu::run`] enters the guest, for example when
+/// the test thread is descheduled for longer than the delay, is remembered
+/// and cancels the run before any guest code runs. Such a run is retried, so
+/// that the caller sees the state of a guest that really ran: a `Canceled`
+/// run that did not add to [`Vcpu::exec_time`] never entered the guest.
+pub fn run_until_kicked(vcpu: &mut Vcpu) -> VcpuExit {
+    run_until_kicked_with(vcpu, |_| {})
+}
+
+/// [`run_until_kicked`], calling `before_run` with the attempt number right
+/// before each run, so tests can delay the run past the kick.
+pub fn run_until_kicked_with(vcpu: &mut Vcpu, mut before_run: impl FnMut(usize)) -> VcpuExit {
+    for attempt in 0..10 {
+        let before = vcpu.exec_time().unwrap();
+        let kicked = kick_after(vcpu.kicker(), Duration::from_millis(50));
+        before_run(attempt);
+        let exit = vcpu.run().unwrap();
+        // The kick was consumed: either by this run, or, if it landed
+        // before the run, by cancelling it at entry.
+        kicked.recv().unwrap().unwrap();
+        if exit != VcpuExit::Canceled || vcpu.exec_time().unwrap() != before {
+            return exit;
+        }
+    }
+    panic!("every run was cancelled before the guest ran");
+}
+
 /// Mach absolute time, the time base of the vCPU's virtual counter.
 pub mod mach_time {
     #[repr(C)]
