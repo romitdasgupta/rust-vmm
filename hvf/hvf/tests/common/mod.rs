@@ -65,6 +65,13 @@ pub const MMIO_GUEST: [u32; 9] = [
 /// Base of the MMIO region [`MMIO_GUEST`] accesses.
 pub const MMIO_BASE: u64 = 0x0900_0000;
 
+/// Whether the environment variable `HVF_REQUIRE=1` is set: CI sets it so
+/// that a host on which Hypervisor.framework is unusable fails the tests
+/// instead of skipping them.
+pub fn hvf_required() -> bool {
+    std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1")
+}
+
 /// Serializes the HVF tests of one test binary (one VM per process) and skips
 /// them when Hypervisor.framework is unusable.
 ///
@@ -77,7 +84,6 @@ pub fn hv_guard() -> Option<MutexGuard<'static, ()>> {
     // A test that failed while holding the lock leaves nothing behind that
     // the next test cares about: its VM was dropped while unwinding.
     let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let require = std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1");
     let reason = if !Hvf::is_supported() {
         "kern.hv_support is not 1".to_string()
     } else {
@@ -88,7 +94,10 @@ pub fn hv_guard() -> Option<MutexGuard<'static, ()>> {
             Err(e) => panic!("cannot create a probe VM: {e}"),
         }
     };
-    assert!(!require, "HVF_REQUIRE=1 but HVF is unusable: {reason}");
+    assert!(
+        !hvf_required(),
+        "HVF_REQUIRE=1 but HVF is unusable: {reason}"
+    );
     println!("SKIP: Hypervisor.framework is unusable: {reason}");
     None
 }

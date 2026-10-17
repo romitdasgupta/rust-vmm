@@ -4,13 +4,13 @@
 //! `Vm::map_guest_memory` (feature `vm-memory`): mapping, validation and
 //! rollback.
 //!
-//! Needs real Hypervisor.framework access; the tests print `SKIP: ...` and
-//! pass when it is unusable, unless `HVF_REQUIRE=1` is set.
+//! Needs real Hypervisor.framework access; see `common::hv_guard`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64", feature = "vm-memory"))]
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+mod common;
 
+use common::hv_guard;
 use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Reg, VcpuExit, Vm, VmConfig};
 use vm_memory::{
     Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
@@ -27,26 +27,6 @@ const DATA_IPA: u64 = 0x8000_0000;
 const GUEST: [u32; 4] = [0xd2b0_0001, 0x5280_0840, 0xb900_0020, 0xd400_0002];
 
 type Mem = GuestMemoryMmap<()>;
-
-/// Serializes the tests of this binary (one VM per process) and skips them
-/// when Hypervisor.framework is unusable, or panics then if `HVF_REQUIRE=1`.
-fn hv_guard() -> Option<MutexGuard<'static, ()>> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let require = std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1");
-    let reason = if !Hvf::is_supported() {
-        "kern.hv_support is not 1".to_string()
-    } else {
-        match Hvf::create_vm(&VmConfig::default()) {
-            Ok(_) => return Some(guard),
-            Err(Error::Hv { err, .. }) if err.is_unavailable() => err.to_string(),
-            Err(e) => panic!("cannot create a VM: {e}"),
-        }
-    };
-    assert!(!require, "HVF_REQUIRE=1 but HVF is unusable: {reason}");
-    println!("SKIP: Hypervisor.framework is unusable: {reason}");
-    None
-}
 
 fn create_vm() -> Vm {
     Hvf::create_vm(&VmConfig::default()).unwrap()
