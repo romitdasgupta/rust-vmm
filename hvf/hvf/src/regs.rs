@@ -590,7 +590,8 @@ mod tests {
     #[test]
     fn test_sys_reg_matches_bindings() {
         // Every system register declared by the bindings has a `SysReg`
-        // constant with the same value and availability.
+        // constant with the same value and availability, and every `SysReg`
+        // is declared by the bindings.
         let mut found = 0;
         for &(name, ty, value, since) in hvf_bindings::regs::__CONSTS {
             let Some(name) = name.strip_prefix("HV_SYS_REG_") else {
@@ -605,7 +606,7 @@ mod tests {
             assert_eq!(info.since, since, "{name}");
             found += 1;
         }
-        assert!(found > 0);
+        assert_eq!(found, SYS_REGS.len());
     }
 
     #[test]
