@@ -72,8 +72,6 @@ pub struct Vcpu {
 /// State shared between a [`Vcpu`] and its [`VcpuKicker`]s.
 #[derive(Debug)]
 pub(crate) struct VcpuShared {
-    /// The vCPU id.
-    pub(crate) id: hv_vcpu_t,
     /// `false` once the vCPU is being destroyed. Held across
     /// `hv_vcpu_destroy` and `hv_vcpus_exit`.
     pub(crate) alive: Mutex<bool>,
@@ -96,13 +94,15 @@ impl VcpuShared {
 /// destroyed vCPU: kicks after the destroy return `Ok(false)`.
 #[derive(Debug, Clone)]
 pub struct VcpuKicker {
+    /// The vCPU id, valid while `shared.alive` is true.
+    pub(crate) id: hv_vcpu_t,
     pub(crate) shared: Arc<VcpuShared>,
 }
 
 impl VcpuKicker {
     /// The id of the vCPU.
     pub fn id(&self) -> u64 {
-        self.shared.id
+        self.id
     }
 
     /// Kicks the vCPU (`hv_vcpus_exit`). Returns `Ok(false)` if the vCPU was
@@ -114,7 +114,7 @@ impl VcpuKicker {
         if !*alive {
             return Ok(false);
         }
-        let mut id = self.shared.id;
+        let mut id = self.id;
         // SAFETY: `hv_vcpus_exit` may be called from any thread and reads one
         // id from the valid pointer. The id names our live vCPU: its destroy
         // has not started, since `Vcpu::drop` clears `alive` under this lock
@@ -160,7 +160,6 @@ impl Vcpu {
         vm: Arc<VmInner>,
     ) -> Result<Vcpu> {
         let shared = Arc::new(VcpuShared {
-            id,
             alive: Mutex::new(true),
         });
         let Some(exit) = NonNull::new(exit) else {
@@ -188,6 +187,7 @@ impl Vcpu {
     /// A handle that kicks this vCPU from any thread.
     pub fn kicker(&self) -> VcpuKicker {
         VcpuKicker {
+            id: self.id,
             shared: self.shared.clone(),
         }
     }
