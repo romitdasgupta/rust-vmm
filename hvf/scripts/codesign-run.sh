@@ -80,4 +80,17 @@ if [ -z "${DYLD_FALLBACK_LIBRARY_PATH:-}" ]; then
     export DYLD_FALLBACK_LIBRARY_PATH
 fi
 
+# With a runner, rustdoc does not tell an edition 2024 merged doctest binary
+# where it lives, so the binary runs all of its doctests in one process
+# ("WARNING: No rustdoc doctest environment variable provided"). hvf allows
+# one VM per process, so two VM-creating doctests would then fail with
+# VmExists. Set the variable rustdoc sets when it runs the binary itself, so
+# that every doctest gets its own process again. Standalone doctests ignore it.
+case "$bin" in
+    */rustdoctest*/*)
+        RUSTDOC_DOCTEST_BIN_PATH=$bin
+        export RUSTDOC_DOCTEST_BIN_PATH
+        ;;
+esac
+
 exec "$bin" "$@"
