@@ -8,7 +8,7 @@
 //! Helper structure for working with mmap'ed memory regions on Xen.
 
 use bitflags::bitflags;
-use libc::{c_int, c_void, _SC_PAGESIZE, MAP_SHARED};
+use libc::{c_int, c_void, MAP_SHARED};
 use std::{io, mem::size_of, os::raw::c_ulong, os::unix::io::AsRawFd, ptr::null_mut, result};
 
 use vmm_sys_util::{
@@ -476,8 +476,7 @@ impl MmapXenFlags {
 }
 
 fn page_size() -> u64 {
-    // SAFETY: Safe because this call just returns the page size and doesn't have any side effects.
-    unsafe { libc::sysconf(_SC_PAGESIZE) as u64 }
+    crate::page_size() as u64
 }
 
 fn pages(size: usize) -> (usize, usize) {

@@ -76,11 +76,18 @@ pub mod mmap;
 #[cfg(feature = "backend-mmap")]
 pub use mmap::{GuestMemoryMmap, GuestRegionMmap, MmapRegion};
 
-/// Returns the host page size, for tests whose offsets and sizes must be page aligned.
+/// Returns the host page size.
 ///
-/// Hard-coding `0x1000` breaks on hosts with larger pages, such as the 16 KiB pages used by
-/// macOS on Apple Silicon.
-#[cfg(all(test, any(feature = "backend-bitmap", feature = "backend-mmap")))]
+/// This is the single place where the crate queries the page size, for both production code
+/// and tests. Never hard-code `0x1000`: hosts may use larger pages, such as the 16 KiB pages
+/// used by macOS on Apple Silicon.
+///
+/// The `cfg` matches the callers: the bitmap backend on every platform, and the unix mmap
+/// backend.
+#[cfg(any(
+    feature = "backend-bitmap",
+    all(feature = "backend-mmap", target_family = "unix")
+))]
 pub(crate) fn page_size() -> usize {
     #[cfg(target_family = "unix")]
     // SAFETY: `sysconf` has no memory safety preconditions.
