@@ -46,8 +46,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use common::{GUEST_IPA, GuestRam, HostMem, SPIN, boot_vcpu, expect_exception, hv_guard, hvc};
+use common::{GUEST_IPA, GuestRam, SPIN, boot_vcpu, expect_exception, hv_guard, hvc, write_u32s};
 use hvf::{Error, ExceptionClass, Hvf, IpaGranule, MemoryFlags, Reg, VmConfig};
+use vm_memory::{FileOffset, MmapRegion, VolatileMemory};
 
 /// Guest physical address of the data page used by the store/load guests.
 const DATA_IPA: u64 = 0x5000_0000;
@@ -119,6 +120,12 @@ fn test_temp_file_replaces_stale_file() {
     assert!(!path.exists());
 }
 
+/// Maps the first `size` bytes of `file` with protection `prot` and mapping
+/// flags `flags` (for example `MAP_SHARED`).
+fn map_file(file: File, size: usize, prot: i32, flags: i32) -> MmapRegion<()> {
+    MmapRegion::build(Some(FileOffset::new(file, 0)), size, prot, flags).unwrap()
+}
+
 /// Creates a vCPU that starts at `GUEST_IPA` with `x0 = value` and
 /// `x1 = addr`, the operands of `STORE_GUEST` and `LOAD_GUEST`.
 fn vcpu_with(vm: &hvf::Vm, value: u64, addr: u64) -> hvf::Vcpu {
@@ -141,7 +148,7 @@ fn test_argument_checks() {
     let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
     let granule = vm.ipa_granule();
     let size = granule as usize;
-    let mem = HostMem::anon(2 * size);
+    let mem = MmapRegion::<()>::new(2 * size).unwrap();
     let host = mem.as_ptr();
 
     let misaligned = |r: hvf::Result<()>, expected: &str| match r {
@@ -206,7 +213,7 @@ fn test_double_map_and_protect_unmapped() {
     let Some(_g) = hv_guard() else { return };
     let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
     let size = vm.ipa_granule() as usize;
-    let mem = HostMem::anon(2 * size);
+    let mem = MmapRegion::<()>::new(2 * size).unwrap();
 
     // SAFETY: `mem` outlives every mapping, all of which are removed before
     // it is dropped, and the host does not access it.
@@ -296,8 +303,8 @@ fn test_4k_granule() {
 
     // A 4 KiB piece in the middle of a (16 KiB) host page, mapped at a 4 KiB
     // aligned address that is not 16 KiB aligned.
-    let mem = HostMem::anon(Hvf::host_page_size().max(0x4000));
-    mem.write_u32s(0x1000, &[hvc(7), SPIN]);
+    let mem = MmapRegion::<()>::new(Hvf::host_page_size().max(0x4000)).unwrap();
+    write_u32s(&mem, 0x1000, &[hvc(7), SPIN]);
     let host = mem.as_ptr().wrapping_add(0x1000);
     // SAFETY: `mem` outlives the mapping, which is removed below, and the
     // host does not access it while the guest runs.
@@ -472,8 +479,8 @@ fn test_shared_file_mapping() {
     let _code = GuestRam::with_code(&vm, &STORE_GUEST);
     let size = vm.ipa_granule() as usize;
     let file = TempFile::new(size);
-    let mem = HostMem::file(
-        &file.file,
+    let mem = map_file(
+        file.file.try_clone().unwrap(),
         size,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_SHARED,
@@ -489,7 +496,7 @@ fn test_shared_file_mapping() {
         ExceptionClass::Hvc { imm: 0 }
     );
     assert_eq!(file.pread_u32(0), 0x1111_1111);
-    assert_eq!(mem.read_u32(0), 0x1111_1111);
+    assert_eq!(mem.get_ref::<u32>(0).unwrap().load(), 0x1111_1111);
 
     // A write to the file is seen by the guest.
     file.pwrite_u32(8, 0x2222_2222);
@@ -519,8 +526,8 @@ fn test_private_file_mapping() {
     let _code = GuestRam::with_code(&vm, &STORE_GUEST);
     let size = vm.ipa_granule() as usize;
     let file = TempFile::new(size);
-    let mem = HostMem::file(
-        &file.file,
+    let mem = map_file(
+        file.file.try_clone().unwrap(),
         size,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_PRIVATE,
@@ -532,7 +539,7 @@ fn test_private_file_mapping() {
         expect_exception(vcpu.run().unwrap()),
         ExceptionClass::Hvc { imm: 0 }
     );
-    assert_eq!(mem.read_u32(4), 0x3333_3333);
+    assert_eq!(mem.get_ref::<u32>(4).unwrap().load(), 0x3333_3333);
     assert_eq!(file.pread_u32(4), 0);
     drop(vcpu);
     vm.unmap(DATA_IPA, size).unwrap();
@@ -547,7 +554,7 @@ fn test_read_only_file_mapping() {
     let size = vm.ipa_granule() as usize;
     let file = TempFile::new(size);
     let ro = File::open(&file.path).unwrap();
-    let mem = HostMem::file(&ro, size, libc::PROT_READ, libc::MAP_SHARED);
+    let mem = map_file(ro, size, libc::PROT_READ, libc::MAP_SHARED);
     for flags in [MemoryFlags::RW, MemoryFlags::READ] {
         assert_hv_error(
             // SAFETY: as in `test_shared_file_mapping`; the call fails.
@@ -566,8 +573,8 @@ fn test_truncated_file_mapping() {
     let _code = GuestRam::with_code(&vm, &STORE_GUEST);
     let size = vm.ipa_granule() as usize;
     let file = TempFile::new(size);
-    let mem = HostMem::file(
-        &file.file,
+    let mem = map_file(
+        file.file.try_clone().unwrap(),
         size,
         libc::PROT_READ | libc::PROT_WRITE,
         libc::MAP_SHARED,
