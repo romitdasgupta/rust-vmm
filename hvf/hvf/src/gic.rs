@@ -13,14 +13,17 @@
 //!
 //! - The GIC must be created before the first vCPU. [`Vm::create_gic`]
 //!   enforces this, and that at most one GIC exists.
-//! - Set `MPIDR_EL1` of each vCPU before its redistributor is used. The
-//!   framework hands out the redistributor frames in vCPU id order, whatever
-//!   the affinity; each frame's `GICR_TYPER` reports the affinity, which is
-//!   how a guest finds its frame.
+//! - Write `MPIDR_EL1` of each vCPU, even if the value is the initial 0,
+//!   before it runs or its redistributor is used: a vCPU whose `MPIDR_EL1`
+//!   was never written has no redistributor. The framework hands out the
+//!   redistributor frames in vCPU id order, whatever the affinity; each
+//!   frame's `GICR_TYPER` reports the affinity, which is how a guest finds
+//!   its frame.
 //! - [`Gic::save_state`] is only meaningful while no vCPU runs, and
-//!   [`Gic::restore_state`] must happen after every vCPU is created and before
-//!   the first run. The crate does not track running vCPUs, so it leaves these
-//!   two rules to the caller and returns whatever the framework reports.
+//!   [`Gic::restore_state`] must happen after every vCPU is created and has
+//!   had its `MPIDR_EL1` written, and before the first run. The crate does
+//!   not track running vCPUs, so it leaves these rules to the caller and
+//!   returns whatever the framework reports.
 //!
 //! With an in-kernel GIC, the framework delivers interrupts to the vCPUs
 //! itself; [`Vcpu::set_pending_interrupt`] then fails with `HV_UNSUPPORTED`.
@@ -265,9 +268,13 @@ impl Gic {
     /// Restores a state blob produced by [`save_state`](Self::save_state)
     /// (`hv_gic_set_state`).
     ///
-    /// Call it after every vCPU is created and before the first run, then
-    /// restore the per-vCPU CPU interface registers. A blob saved on another
-    /// macOS release may be rejected.
+    /// Call it after every vCPU is created and has had its `MPIDR_EL1`
+    /// written, and before the first run; then restore the per-vCPU CPU
+    /// interface registers. The framework skips the redistributor state of
+    /// any vCPU whose `MPIDR_EL1` has not been written yet and still returns
+    /// `Ok`, so restore `MPIDR_EL1` before calling this, not afterwards with
+    /// the other per-vCPU registers. A blob saved on another macOS release
+    /// may be rejected.
     pub fn restore_state(&self, state: &[u8]) -> Result<()> {
         let f = need!(hv_gic_set_state);
         let data = if state.is_empty() {
@@ -285,9 +292,11 @@ impl Vcpu {
     /// The guest physical base address of this vCPU's redistributor
     /// (`hv_gic_get_redistributor_base`, macOS 15.0).
     ///
-    /// Set `MPIDR_EL1` first. The frame goes by vCPU id, not by affinity:
-    /// the vCPU with id `n` gets `redistributor_base + n * redistributor_size`,
-    /// and that frame's `GICR_TYPER` reports the vCPU's `MPIDR_EL1` affinity.
+    /// Write `MPIDR_EL1` first, even if it stays 0: until then the vCPU has
+    /// no redistributor and this fails. The frame goes by vCPU id, not by
+    /// affinity: the vCPU with id `n` gets
+    /// `redistributor_base + n * redistributor_size`, and that frame's
+    /// `GICR_TYPER` reports the vCPU's `MPIDR_EL1` affinity.
     pub fn gic_redistributor_base(&self) -> Result<u64> {
         let f = need!(hv_gic_get_redistributor_base);
         // SAFETY: owning thread, live vCPU, pointer valid for a `hv_ipa_t`.

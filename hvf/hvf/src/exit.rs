@@ -231,13 +231,17 @@ impl DataAbort {
     }
 
     /// Whether this is a translation fault (`(dfsc & 0x3c) == 0x04`), as for
-    /// an access to unmapped (MMIO) memory.
+    /// an access to unmapped (MMIO) memory. A forbidden access to mapped
+    /// memory the guest has not touched yet reports one too (see
+    /// `Vm::protect`), so check the IPA against the guest memory map before
+    /// treating the abort as MMIO.
     pub fn is_translation_fault(&self) -> bool {
         (self.dfsc & 0x3c) == 0x04
     }
 
     /// Whether this is a permission fault (`(dfsc & 0x3c) == 0x0c`), as for a
-    /// write to memory mapped read-only.
+    /// write to read-only memory the guest has already accessed. The first
+    /// access to such a page can report a translation fault instead.
     pub fn is_permission_fault(&self) -> bool {
         (self.dfsc & 0x3c) == 0x0c
     }

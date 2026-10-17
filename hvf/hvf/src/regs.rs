@@ -98,6 +98,24 @@ pub struct SysReg(pub hv::hv_sys_reg_t);
 // same `op0:op1:CRn:CRm:op2` layout as `hv_sys_reg_t`.
 const KVM_ARM64_SYSREG_ID_BASE: u64 = 0x6000_0000_0000_0000 | 0x0030_0000_0000_0000 | 0x0013 << 16;
 
+/// Converts between a system register encoding and the low 16 bits of its
+/// KVM one-reg id, which are the same except for two registers: the Linux
+/// uapi defines `KVM_REG_ARM_TIMER_CVAL` as `ARM64_SYS_REG(3, 3, 14, 0, 2)`
+/// (the encoding of `CNTVCT_EL0`) and `KVM_REG_ARM_TIMER_CNT` as
+/// `ARM64_SYS_REG(3, 3, 14, 3, 2)` (that of `CNTV_CVAL_EL0`), an accidental
+/// swap kept for compatibility. The conversion is its own inverse.
+const fn kvm_swap_timer(encoding: u16) -> u16 {
+    /// `CNTVCT_EL0`, `(3, 3, 14, 0, 2)`.
+    const CNTVCT_EL0: u16 = 0xdf02;
+    /// `CNTV_CVAL_EL0`, `(3, 3, 14, 3, 2)`.
+    const CNTV_CVAL_EL0: u16 = 0xdf1a;
+    match encoding {
+        CNTVCT_EL0 => CNTV_CVAL_EL0,
+        CNTV_CVAL_EL0 => CNTVCT_EL0,
+        other => other,
+    }
+}
+
 impl SysReg {
     /// Builds the identifier from the `MRS`/`MSR` operand fields.
     ///
@@ -138,13 +156,18 @@ impl SysReg {
 
     /// Converts a KVM `KVM_REG_ARM64_SYSREG` one-reg id, or returns `None` if
     /// `id` is not a 64-bit arm64 system register id.
+    ///
+    /// Like KVM, this maps `KVM_REG_ARM_TIMER_CVAL` to `CNTV_CVAL_EL0` and
+    /// `KVM_REG_ARM_TIMER_CNT` to `CNTVCT_EL0`: the Linux uapi defines those
+    /// two ids with each other's encodings.
     pub fn from_kvm_one_reg_id(id: u64) -> Option<SysReg> {
-        (id & !0xffff == KVM_ARM64_SYSREG_ID_BASE).then_some(SysReg(id as u16))
+        (id & !0xffff == KVM_ARM64_SYSREG_ID_BASE).then_some(SysReg(kvm_swap_timer(id as u16)))
     }
 
-    /// The equivalent KVM `KVM_REG_ARM64_SYSREG` one-reg id.
+    /// The equivalent KVM `KVM_REG_ARM64_SYSREG` one-reg id, with KVM's
+    /// swapped timer ids (see [`from_kvm_one_reg_id`](Self::from_kvm_one_reg_id)).
     pub fn to_kvm_one_reg_id(self) -> u64 {
-        KVM_ARM64_SYSREG_ID_BASE | u64::from(self.0)
+        KVM_ARM64_SYSREG_ID_BASE | u64::from(kvm_swap_timer(self.0))
     }
 }
 
@@ -580,6 +603,25 @@ mod tests {
         assert_eq!(
             SysReg::from_kvm_one_reg_id(KVM_CNTV_CTL_EL0),
             Some(SysReg::CNTV_CTL_EL0)
+        );
+
+        // KVM_REG_ARM_TIMER_CVAL and KVM_REG_ARM_TIMER_CNT from the Linux
+        // uapi headers, which swap the encodings of the two registers.
+        const KVM_REG_ARM_TIMER_CVAL: u64 = 0x6030_0000_0013_df02;
+        const KVM_REG_ARM_TIMER_CNT: u64 = 0x6030_0000_0013_df1a;
+        let cntvct_el0 = SysReg::from_encoding(3, 3, 14, 0, 2);
+        assert_eq!(
+            SysReg::CNTV_CVAL_EL0.to_kvm_one_reg_id(),
+            KVM_REG_ARM_TIMER_CVAL
+        );
+        assert_eq!(
+            SysReg::from_kvm_one_reg_id(KVM_REG_ARM_TIMER_CVAL),
+            Some(SysReg::CNTV_CVAL_EL0)
+        );
+        assert_eq!(cntvct_el0.to_kvm_one_reg_id(), KVM_REG_ARM_TIMER_CNT);
+        assert_eq!(
+            SysReg::from_kvm_one_reg_id(KVM_REG_ARM_TIMER_CNT),
+            Some(cntvct_el0)
         );
 
         for info in SYS_REGS {

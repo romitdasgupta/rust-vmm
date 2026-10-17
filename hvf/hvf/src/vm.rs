@@ -327,9 +327,16 @@ impl Vm {
     /// (`hv_vm_protect`).
     ///
     /// The arguments are checked as for [`map`](Self::map). Fails with
-    /// `HV_ERROR` if the range is not mapped. A guest access the new
-    /// permissions forbid exits with a permission fault, which can be used
-    /// for dirty page tracking.
+    /// `HV_ERROR` if the range is not mapped.
+    ///
+    /// A guest access the new permissions forbid exits with an abort. For a
+    /// page the guest has already accessed this is a permission fault, but
+    /// for a page it has not touched yet the framework reports a translation
+    /// fault, with the same syndrome as an access to unmapped (MMIO) memory.
+    /// A dirty page tracker must therefore treat every write abort on a
+    /// range it mapped as a dirtying write, whatever the fault status code,
+    /// and retry the store (without advancing the PC) once the page is
+    /// writable again.
     pub fn protect(&self, ipa: u64, size: usize, flags: MemoryFlags) -> Result<()> {
         check_map_args(None, ipa, size, self.0.granule, self.0.ipa_bits)?;
         // SAFETY: changing guest permissions of an existing mapping does not

@@ -33,9 +33,15 @@ const XZR: u8 = 31;
 /// `Vcpu` is neither `Send` nor `Sync`. Dropping it destroys the vCPU, on the
 /// owning thread, and lets the VM be destroyed once no other handle remains.
 ///
-/// The initial `MPIDR_EL1` and `CPSR` are 0; set `CPSR` explicitly (for
-/// example `0x3c5`, EL1h with interrupts masked) and `MPIDR_EL1` if the guest
-/// or the GIC needs distinct affinities.
+/// The initial `MPIDR_EL1` and `CPSR` read as 0; set `CPSR` explicitly (for
+/// example `0x3c5`, EL1h with interrupts masked). With the in-kernel GIC,
+/// also write `MPIDR_EL1` on every vCPU, even when 0 is the wanted affinity,
+/// before it runs or its redistributor is used or restored: until it is
+/// written, the vCPU has no redistributor. Guest accesses to its frame then
+/// exit as MMIO, [`gic_redistributor_base`](Self::gic_redistributor_base)
+/// fails with `HV_BAD_ARGUMENT`, and the redistributor register accessors
+/// fail with `HV_DENIED`, which here does not mean a missing entitlement.
+/// Without a GIC, set `MPIDR_EL1` if the guest needs distinct affinities.
 ///
 /// Moving a vCPU to another thread does not compile:
 ///

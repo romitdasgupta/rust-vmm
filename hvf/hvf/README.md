@@ -260,8 +260,10 @@ instruction. `ExceptionClass::pc_advanced_by_hw()` reports which case applies.
 | `InstructionAbort`, `Breakpoint`, `SoftwareStep`, `Watchpoint`, `Brk` | at the instruction | VMM-specific |
 
 The crate does not set `MPIDR_EL1` or `CPSR`. Both start at 0. Set `CPSR`
-explicitly, typically to `0x3c5` (EL1h with DAIF masked), and set `MPIDR_EL1`
-when the guest or the GIC needs distinct affinities.
+explicitly, typically to `0x3c5` (EL1h with DAIF masked). With the in-kernel
+GIC, always write `MPIDR_EL1`, even to 0: a vCPU whose `MPIDR_EL1` was never
+written has no redistributor. Without a GIC, set it when the guest needs
+distinct affinities.
 
 ### MMIO
 
@@ -341,8 +343,11 @@ called (alignment, IPA range, overlap, MSI range inside the SPI range).
 
 - **Create order.** Create the GIC before the first vCPU. Afterwards,
   `create_gic` returns `Error::GicAfterVcpu`.
-- **Redistributors.** Set each vCPU's `MPIDR_EL1` before using its
-  redistributor. Redistributors are assigned in vCPU id order, whatever the
+- **Redistributors.** Write each vCPU's `MPIDR_EL1`, even if the value is
+  the initial 0, before it runs or its redistributor is used: until then the
+  vCPU has no redistributor, its frame exits to the VMM as MMIO, and the
+  redistributor accessors fail with `HV_BAD_ARGUMENT` or `HV_DENIED`.
+  Redistributors are assigned in vCPU id order, whatever the
   affinity: `Vcpu::gic_redistributor_base()` is
   `redistributor_base + id * size`, and the frame's `GICR_TYPER` reports the
   vCPU's affinity.
@@ -354,8 +359,10 @@ called (alignment, IPA range, overlap, MSI range inside the SPI range).
   `pending_interrupt` fail with `HV_UNSUPPORTED`.
 - **ICH and ICV.** The ICH and ICV accessors work only when EL2 is enabled.
 - **Save and restore.** Take `Gic::save_state` while no vCPU runs. Call
-  `Gic::restore_state` after creating every vCPU and before the first run,
-  then restore the per-vCPU CPU interface registers (`gic_icc_reg`, and
+  `Gic::restore_state` after creating every vCPU and writing its
+  `MPIDR_EL1`, and before the first run: the framework silently skips the
+  redistributor state of a vCPU whose `MPIDR_EL1` is not written yet. Then
+  restore the per-vCPU CPU interface registers (`gic_icc_reg`, and
   `gic_ich_reg` with EL2). The crate does not track running vCPUs, so these
   rules are not enforced. On macOS 27, a restore after a vCPU has run also
   succeeds, but Apple does not document this.
