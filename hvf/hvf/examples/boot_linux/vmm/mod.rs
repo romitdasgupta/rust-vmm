@@ -29,6 +29,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -110,6 +111,47 @@ impl Log {
     }
 }
 
+/// Something the guest did that the VMM ignores, logged once per key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Warning {
+    /// A write to an address no device claims.
+    MmioWrite(u64),
+    /// A read from an address no device claims.
+    MmioRead(u64),
+    /// A read of an unmodelled system register.
+    SysRegRead(hvf::SysReg),
+    /// A write to an unmodelled system register.
+    SysRegWrite(hvf::SysReg),
+    /// A `VtimerActivated` exit, which the in-kernel GIC should prevent.
+    Vtimer,
+}
+
+/// Remembers which [`Warning`]s were logged, up to [`WarnOnce::LIMIT`].
+#[derive(Debug, Default)]
+struct WarnOnce {
+    seen: Mutex<HashSet<Warning>>,
+    /// Set once `seen` is full, so that later calls skip the lock.
+    full: AtomicBool,
+}
+
+impl WarnOnce {
+    /// How many distinct warnings are logged before the rest are dropped.
+    const LIMIT: usize = 64;
+
+    /// Returns `true` the first time `key` is seen, while there is room.
+    fn first(&self, key: Warning) -> bool {
+        if self.full.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= Self::LIMIT {
+            self.full.store(true, Ordering::Relaxed);
+            return false;
+        }
+        seen.insert(key)
+    }
+}
+
 /// State shared by the vCPU threads.
 pub struct Machine {
     vm: Vm,
@@ -119,7 +161,7 @@ pub struct Machine {
     kickers: Mutex<Vec<Option<VcpuKicker>>>,
     /// Set once, by the first vCPU that stops the machine.
     outcome: Mutex<Option<std::result::Result<Outcome, String>>>,
-    warned: Mutex<HashSet<String>>,
+    warned: WarnOnce,
     log: Log,
 }
 
@@ -158,17 +200,15 @@ impl Machine {
         self.stop(Err(message));
     }
 
-    /// Logs `message` the first time it occurs.
-    fn warn_once(&self, message: String) {
-        {
-            let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
-            if warned.len() >= 64 || warned.contains(&message) {
-                return;
-            }
-            warned.insert(message.clone());
+    /// Logs the message `describe` builds the first time `key` occurs. The
+    /// message is formatted only then, so a guest that keeps poking an
+    /// unmodelled address costs no allocation per exit.
+    fn warn_once(&self, key: Warning, describe: impl FnOnce() -> String) {
+        if self.warned.first(key) {
+            // Outside the lock, so that a slow stderr holds up only this
+            // vCPU.
+            self.log.print(format_args!("{}", describe()));
         }
-        // Outside the lock, so that a slow stderr holds up only this vCPU.
-        self.log.print(format_args!("{message}"));
     }
 
     /// Logs when verbose.
@@ -438,7 +478,7 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         cpus: psci::Cpus::new(cfg.cpus, entry, placement.dtb),
         kickers: Mutex::new(vec![None; cfg.cpus]),
         outcome: Mutex::new(None),
-        warned: Mutex::new(HashSet::new()),
+        warned: WarnOnce::default(),
         log,
     });
     if let Some(input) = cfg.input {
@@ -521,6 +561,23 @@ mod tests {
         let mut elf = header();
         elf[0x38] = 0;
         assert!(check_image_header(&elf).is_err());
+    }
+
+    #[test]
+    fn test_warn_once() {
+        let warned = WarnOnce::default();
+        assert!(warned.first(Warning::MmioWrite(0x1000)));
+        assert!(!warned.first(Warning::MmioWrite(0x1000)));
+        // Same address, different kind.
+        assert!(warned.first(Warning::MmioRead(0x1000)));
+        assert!(warned.first(Warning::Vtimer));
+        for addr in 0..WarnOnce::LIMIT as u64 {
+            warned.first(Warning::MmioRead(0x2000 + addr));
+        }
+        // Full: nothing new is logged, and seen keys stay quiet.
+        assert!(!warned.first(Warning::MmioRead(0x9999)));
+        assert!(!warned.first(Warning::MmioWrite(0x1000)));
+        assert_eq!(warned.seen.lock().unwrap().len(), WarnOnce::LIMIT);
     }
 
     #[test]

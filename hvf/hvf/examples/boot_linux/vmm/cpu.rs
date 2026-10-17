@@ -11,7 +11,7 @@ use vm_device::bus::MmioAddress;
 use vm_device::device_manager::MmioManager;
 
 use super::psci::{self, Action};
-use super::{Machine, Outcome, Result, sysreg};
+use super::{Machine, Outcome, Result, Warning, sysreg};
 
 /// `CPSR` at entry: EL1h with D, A, I and F masked, as Linux's boot
 /// protocol requires.
@@ -169,7 +169,9 @@ fn run(machine: &Machine, index: usize, vcpu: &mut Vcpu) -> Result<Stop> {
             VcpuExit::VtimerActivated => {
                 // Only without the in-kernel GIC, which delivers the timer
                 // interrupt (PPI 27) itself.
-                machine.warn_once("unexpected VtimerActivated exit".to_string());
+                machine.warn_once(Warning::Vtimer, || {
+                    "unexpected VtimerActivated exit".to_string()
+                });
                 vtimer_masked = true;
                 continue;
             }
@@ -258,17 +260,25 @@ fn mmio(
     // are dropped and reads return zero.
     if abort.write {
         let value = vcpu.mmio_write_value(&access)?;
-        if machine.bus.mmio_write(addr, &value.to_le_bytes()[..len]).is_err() {
-            machine.warn_once(format!(
-                "ignored {len}-byte MMIO write of {value:#x} to {:#x}",
-                abort.ipa
-            ));
+        if machine
+            .bus
+            .mmio_write(addr, &value.to_le_bytes()[..len])
+            .is_err()
+        {
+            machine.warn_once(Warning::MmioWrite(abort.ipa), || {
+                format!(
+                    "ignored {len}-byte MMIO write of {value:#x} to {:#x}",
+                    abort.ipa
+                )
+            });
         }
         vcpu.advance_pc()?;
     } else {
         let mut bytes = [0u8; 8];
         if machine.bus.mmio_read(addr, &mut bytes[..len]).is_err() {
-            machine.warn_once(format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa));
+            machine.warn_once(Warning::MmioRead(abort.ipa), || {
+                format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa)
+            });
         }
         vcpu.complete_mmio_read(&access, u64::from_le_bytes(bytes))?;
     }

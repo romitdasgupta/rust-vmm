@@ -7,11 +7,11 @@
 //! (`ICC_*`) and the timers (`CNTP_*`, `CNTV_*`) itself. What is left for a
 //! Linux guest are the OS lock and debug communication channel registers,
 //! which Linux touches on every CPU. Everything else reads as zero and
-//! ignores writes (RAZ/WI), logged once per register.
+//! ignores writes (RAZ/WI), logged once per register and direction.
 
 use hvf::{Reg, SysReg, SysRegAccess, Vcpu};
 
-use super::{Machine, Result};
+use super::{Machine, Result, Warning};
 
 /// `OSLAR_EL1`: Linux writes 0 to clear the OS lock.
 const OSLAR_EL1: SysReg = SysReg::from_encoding(2, 0, 1, 0, 4);
@@ -41,7 +41,9 @@ pub fn emulate(machine: &Machine, vcpu: &mut Vcpu, access: &SysRegAccess) -> Res
             OSDLR_EL1 | MDCCSR_EL0 => 0,
             SysReg::MDCCINT_EL1 => vcpu.get_sys_reg(SysReg::MDCCINT_EL1)?,
             reg => {
-                machine.warn_once(format!("RAZ read of {}", name(reg)));
+                machine.warn_once(Warning::SysRegRead(reg), || {
+                    format!("RAZ read of {}", name(reg))
+                });
                 0
             }
         };
@@ -56,7 +58,9 @@ pub fn emulate(machine: &Machine, vcpu: &mut Vcpu, access: &SysRegAccess) -> Res
         match access.reg {
             OSLAR_EL1 | OSDLR_EL1 => {}
             SysReg::MDCCINT_EL1 => vcpu.set_sys_reg(SysReg::MDCCINT_EL1, value)?,
-            reg => machine.warn_once(format!("ignored write of {value:#x} to {}", name(reg))),
+            reg => machine.warn_once(Warning::SysRegWrite(reg), || {
+                format!("ignored write of {value:#x} to {}", name(reg))
+            }),
         }
     }
     vcpu.advance_pc()?;
