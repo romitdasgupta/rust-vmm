@@ -36,15 +36,27 @@ case "$bin" in
         ;;
 esac
 
-log=$(mktemp "${TMPDIR:-/tmp}/hvf-codesign.XXXXXX")
-trap 'rm -f "$log"' EXIT
+# Several processes may run the same binary at once (cargo-nextest runs each
+# test in its own process, or two `cargo test` run side by side). Signing in
+# place would let them rewrite the file under each other, so skip binaries
+# that already carry the entitlement, and otherwise sign a private copy and
+# rename it into place: every process then executes a fully signed file.
+if ! codesign -d --entitlements - "$bin" 2>/dev/null |
+    grep -q com.apple.security.hypervisor; then
+    tmp="$bin.codesign.$$"
+    log=$(mktemp "${TMPDIR:-/tmp}/hvf-codesign.XXXXXX")
+    trap 'rm -f "$tmp" "$tmp.cstemp" "$log"' EXIT
 
-if ! codesign --sign - --force --entitlements "$here/hvf.entitlements" "$bin" >"$log" 2>&1; then
-    echo "codesign-run.sh: failed to sign $bin:" >&2
-    cat "$log" >&2
-    exit 1
+    cp -p "$bin" "$tmp"
+    if ! codesign --sign - --force --entitlements "$here/hvf.entitlements" "$tmp" >"$log" 2>&1; then
+        echo "codesign-run.sh: failed to sign $bin:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    mv -f "$tmp" "$bin"
+
+    rm -f "$log"
+    trap - EXIT
 fi
 
-rm -f "$log"
-trap - EXIT
 exec "$bin" "$@"
