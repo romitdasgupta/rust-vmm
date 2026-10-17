@@ -74,9 +74,18 @@ jobs:
       env:
         RUSTDOCFLAGS: "-D warnings"
 
+    # `direct` can only be named through the identifier itself, so a whole-word
+    # match also catches `hv::direct::`, `functions::direct` and `direct` in a
+    # `use hvf_bindings::{...}` list. grep exits 1 for "no match" and 2 for an
+    # error, which must not pass as "no match".
     - name: Check that hvf only uses run-time resolved newer functions
       run: |
-        if grep -rn 'hvf_bindings::direct' hvf/hvf/src; then
+        status=0
+        grep -rnw direct hvf/hvf/src || status=$?
+        if [ "$status" -eq 0 ]; then
           echo "hvf must call functions newer than macOS 11.0 through DynApi, not hvf_bindings::direct" >&2
           exit 1
+        elif [ "$status" -ne 1 ]; then
+          echo "grep failed with status $status" >&2
+          exit 2
         fi

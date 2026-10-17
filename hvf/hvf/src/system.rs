@@ -467,6 +467,20 @@ pub(crate) mod tests {
         None
     }
 
+    /// Whether the host supports Hypervisor.framework, for the tests that
+    /// need neither the entitlement nor a VM. Prints `SKIP` and returns
+    /// `false` on hosts without it (such as macOS VMs without nested
+    /// virtualization), unless `HVF_REQUIRE=1`.
+    fn hv_supported() -> bool {
+        if Hvf::is_supported() {
+            return true;
+        }
+        let require = std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1");
+        assert!(!require, "HVF_REQUIRE=1 but kern.hv_support is not 1");
+        println!("SKIP: Hypervisor.framework is unusable: kern.hv_support is not 1");
+        false
+    }
+
     #[test]
     fn test_ipa_granule() {
         assert_eq!(IpaGranule::K4.bytes(), 4096);
@@ -496,10 +510,13 @@ pub(crate) mod tests {
 
     #[test]
     fn test_probes() {
-        // None of these need the entitlement or a VM.
-        assert!(Hvf::is_supported());
+        // None of these need the entitlement or a VM, but all except the page
+        // size need a host that supports the framework.
         assert!(Hvf::host_page_size().is_power_of_two());
         assert!(Hvf::host_page_size() >= 4096);
+        if !hv_supported() {
+            return;
+        }
         assert!(Hvf::max_vcpu_count().unwrap() >= 1);
 
         let max = Hvf::max_ipa_bits().unwrap();
@@ -541,6 +558,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vcpu_config() {
+        if !hv_supported() {
+            return;
+        }
         let cfg = VcpuConfig::new().unwrap();
         assert_ne!(cfg.feature_reg(FeatureReg::ID_AA64PFR0_EL1).unwrap(), 0);
         assert_ne!(cfg.feature_reg(FeatureReg::ID_AA64ISAR0_EL1).unwrap(), 0);

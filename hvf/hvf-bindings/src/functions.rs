@@ -490,6 +490,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vcpu_config_feature_regs() {
+        // The feature registers come from the kernel, so this needs a host
+        // that can run VMs (not, for example, a macOS VM without nested
+        // virtualization); `TestVm` skips the test otherwise.
+        let Some(_vm) = TestVm::new() else { return };
         // SAFETY: no preconditions.
         let config = unsafe { hv_vcpu_config_create() };
         assert!(!config.is_null());

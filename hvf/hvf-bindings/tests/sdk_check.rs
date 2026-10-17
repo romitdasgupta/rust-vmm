@@ -193,8 +193,23 @@ fn scalar_types() -> Vec<(&'static str, usize, bool)> {
     ]
 }
 
-/// The `_Static_assert`s for struct layouts, with the Rust values.
-fn layout_asserts(c: &mut String) {
+/// The first macOS release that declares the scalar type `name`: that of its
+/// oldest constant. Types without constants (`hv_ipa_t`, ...) exist in every
+/// SDK the bindings support.
+fn type_since(name: &str) -> Option<(u16, u16)> {
+    all_consts().filter(|c| c.1 == name).map(|c| c.3).min()
+}
+
+/// The `_Static_assert`s for the layouts of the structs `sdk` declares, with
+/// the Rust values.
+fn layout_asserts(sdk: &Sdk, c: &mut String) {
+    /// Every SDK the bindings support.
+    const BASE: (u16, u16) = (11, 0);
+    /// The SME state types.
+    const SME: (u16, u16) = (15, 2);
+    /// The GIC configuration and state objects.
+    const GIC: (u16, u16) = (15, 0);
+
     let mut check = |expr: String| {
         writeln!(c, "_Static_assert({expr}, \"layout: {expr}\");").unwrap();
     };
@@ -218,51 +233,76 @@ fn layout_asserts(c: &mut String) {
         physical_address
     });
     layout!(hv_vcpu_exit_t { reason, exception });
-    layout!(hv_vcpu_sme_state_t {
-        streaming_sve_mode_enabled,
-        za_storage_enabled
-    });
     layout!(hv_simd_fp_uchar16_t {});
-    layout!(hv_sme_zt0_uchar64_t {});
+    if sdk.has(SME) {
+        layout!(hv_vcpu_sme_state_t {
+            streaming_sve_mode_enabled,
+            za_storage_enabled
+        });
+        layout!(hv_sme_zt0_uchar64_t {});
+    }
 
     // Field types (the offsets above only pin down their positions).
-    for (ty, field, c_ty) in [
-        ("hv_vcpu_exit_t", "reason", "hv_exit_reason_t"),
-        ("hv_vcpu_exit_t", "exception", "hv_vcpu_exit_exception_t"),
+    for (since, ty, field, c_ty) in [
+        (BASE, "hv_vcpu_exit_t", "reason", "hv_exit_reason_t"),
         (
+            BASE,
+            "hv_vcpu_exit_t",
+            "exception",
+            "hv_vcpu_exit_exception_t",
+        ),
+        (
+            BASE,
             "hv_vcpu_exit_exception_t",
             "syndrome",
             "hv_exception_syndrome_t",
         ),
         (
+            BASE,
             "hv_vcpu_exit_exception_t",
             "virtual_address",
             "hv_exception_address_t",
         ),
-        ("hv_vcpu_exit_exception_t", "physical_address", "hv_ipa_t"),
-        ("hv_vcpu_sme_state_t", "streaming_sve_mode_enabled", "bool"),
-        ("hv_vcpu_sme_state_t", "za_storage_enabled", "bool"),
+        (
+            BASE,
+            "hv_vcpu_exit_exception_t",
+            "physical_address",
+            "hv_ipa_t",
+        ),
+        (
+            SME,
+            "hv_vcpu_sme_state_t",
+            "streaming_sve_mode_enabled",
+            "bool",
+        ),
+        (SME, "hv_vcpu_sme_state_t", "za_storage_enabled", "bool"),
     ] {
-        check(format!(
-            "__builtin_types_compatible_p(__typeof__((({ty} *)0)->{field}), {c_ty})"
-        ));
+        if sdk.has(since) {
+            check(format!(
+                "__builtin_types_compatible_p(__typeof__((({ty} *)0)->{field}), {c_ty})"
+            ));
+        }
     }
 
     // The vector types: element type and count, which the Rust newtypes
     // represent as a byte array.
     check("__builtin_types_compatible_p(hv_simd_fp_uchar16_t, rs_uchar16)".into());
-    check("__builtin_types_compatible_p(hv_sme_zt0_uchar64_t, rs_uchar64)".into());
+    if sdk.has(SME) {
+        check("__builtin_types_compatible_p(hv_sme_zt0_uchar64_t, rs_uchar64)".into());
+    }
 
     // The opaque objects are pointers to the structs of the same name.
-    for name in [
-        "hv_vm_config",
-        "hv_vcpu_config",
-        "hv_gic_config",
-        "hv_gic_state",
+    for (name, since) in [
+        ("hv_vm_config", BASE),
+        ("hv_vcpu_config", BASE),
+        ("hv_gic_config", GIC),
+        ("hv_gic_state", GIC),
     ] {
-        check(format!(
-            "__builtin_types_compatible_p({name}_t, struct {name}_s *)"
-        ));
+        if sdk.has(since) {
+            check(format!(
+                "__builtin_types_compatible_p({name}_t, struct {name}_s *)"
+            ));
+        }
     }
 }
 
@@ -277,9 +317,14 @@ fn test_values_types_and_layout() {
          typedef __attribute__((ext_vector_type(64))) uint8_t rs_uchar64;\n\n",
     );
 
-    // Scalar types.
+    // Scalar types, except those newer than the SDK.
     let types = scalar_types();
+    let mut checked_types = 0;
     for &(name, size, signed) in &types {
+        if type_since(name).is_some_and(|since| !sdk.has(since)) {
+            continue;
+        }
+        checked_types += 1;
         writeln!(
             c,
             "_Static_assert(sizeof({name}) == {size} && (({name})-1 < ({name})0) == {}, \"type {name}\");",
@@ -302,7 +347,7 @@ fn test_values_types_and_layout() {
         }
     }
 
-    layout_asserts(&mut c);
+    layout_asserts(&sdk, &mut c);
 
     // Function prototypes. The SIMD setter's by-value vector argument is what
     // the trampoline assumes.
@@ -348,8 +393,7 @@ fn test_values_types_and_layout() {
     );
     assert!(consts > 0);
     eprintln!(
-        "checked {consts} constants, {} types against SDK {:?}",
-        types.len(),
+        "checked {consts} constants, {checked_types} types against SDK {:?}",
         sdk.version
     );
 }
