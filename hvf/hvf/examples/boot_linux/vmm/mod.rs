@@ -9,6 +9,7 @@
 //! - [`psci`]: CPU power management and system power off over `HVC`.
 //! - [`sysreg`]: the system registers the framework traps.
 //! - [`cpu`]: vCPU threads and their exit loop.
+//! - [`input`]: the console input thread and the `Ctrl-A` escape.
 //!
 //! The in-kernel GICv3 of macOS 15 provides the interrupt controller, the
 //! timer interrupts and `WFI` handling, so the VMM needs no interrupt
@@ -18,6 +19,7 @@ pub mod layout;
 
 mod cpu;
 mod fdt;
+mod input;
 mod pl011;
 mod psci;
 mod sysreg;
@@ -28,19 +30,24 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::ops::ControlFlow;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hvf::{GicConfig, GicIntid, Hvf, MemoryFlags, Vcpu, VcpuKicker, Vm, VmConfig};
 use linux_loader::cmdline::Cmdline;
 use linux_loader::loader::{KernelLoader, PE};
-use vm_device::DeviceMmio;
-use vm_device::bus::{Bus, BusRange, MmioAddress};
+use vm_device::bus::{BusRange, MmioAddress};
+use vm_device::device_manager::{IoManager, MmioManager};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use layout::{DTB_MAX_SIZE, GICD_BASE, GICR_BASE, RAM_BASE, SZ_2M, UART_BASE, UART_SIZE, UART_SPI};
+use layout::{
+    DTB_MAX_SIZE, GICD_BASE, GICR_BASE, RAM_BASE, SZ_2M, UART_BASE, UART_INTID, UART_SIZE,
+};
 use pl011::Pl011;
 
 /// The error type of the VMM.
@@ -76,8 +83,10 @@ pub struct Config {
     /// Where the console output goes.
     pub output: Box<dyn Write + Send>,
     /// Where console input comes from. `Ctrl-A x` in the input stops the
-    /// VMM; `Ctrl-A Ctrl-A` sends a `Ctrl-A`.
-    pub input: Option<Box<dyn Read + Send>>,
+    /// VMM; `Ctrl-A Ctrl-A` sends a `Ctrl-A`. It is read by a thread that
+    /// [`run`] stops before it returns, so a later `run` can use (a
+    /// duplicate of) the same input without losing anything.
+    pub input: Option<OwnedFd>,
     /// The terminal is in raw mode, so log lines end with `\r\n`.
     pub raw_terminal: bool,
 }
@@ -110,18 +119,57 @@ impl Log {
     }
 }
 
-type MmioBus = Bus<MmioAddress, Arc<dyn DeviceMmio + Send + Sync>>;
+/// Something the guest did that the VMM ignores, logged once per key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Warning {
+    /// A write to an address no device claims.
+    MmioWrite(u64),
+    /// A read from an address no device claims.
+    MmioRead(u64),
+    /// A read of an unmodelled system register.
+    SysRegRead(hvf::SysReg),
+    /// A write to an unmodelled system register.
+    SysRegWrite(hvf::SysReg),
+    /// A `VtimerActivated` exit, which the in-kernel GIC should prevent.
+    Vtimer,
+}
+
+/// Remembers which [`Warning`]s were logged, up to [`WarnOnce::LIMIT`].
+#[derive(Debug, Default)]
+struct WarnOnce {
+    seen: Mutex<HashSet<Warning>>,
+    /// Set once `seen` is full, so that later calls skip the lock.
+    full: AtomicBool,
+}
+
+impl WarnOnce {
+    /// How many distinct warnings are logged before the rest are dropped.
+    const LIMIT: usize = 64;
+
+    /// Returns `true` the first time `key` is seen, while there is room.
+    fn first(&self, key: Warning) -> bool {
+        if self.full.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= Self::LIMIT {
+            self.full.store(true, Ordering::Relaxed);
+            return false;
+        }
+        seen.insert(key)
+    }
+}
 
 /// State shared by the vCPU threads.
 pub struct Machine {
     vm: Vm,
-    bus: MmioBus,
+    bus: IoManager,
     console: Arc<Pl011>,
     cpus: psci::Cpus,
     kickers: Mutex<Vec<Option<VcpuKicker>>>,
     /// Set once, by the first vCPU that stops the machine.
     outcome: Mutex<Option<std::result::Result<Outcome, String>>>,
-    warned: Mutex<HashSet<String>>,
+    warned: WarnOnce,
     log: Log,
 }
 
@@ -160,17 +208,15 @@ impl Machine {
         self.stop(Err(message));
     }
 
-    /// Logs `message` the first time it occurs.
-    fn warn_once(&self, message: String) {
-        {
-            let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
-            if warned.len() >= 64 || warned.contains(&message) {
-                return;
-            }
-            warned.insert(message.clone());
+    /// Logs the message `describe` builds the first time `key` occurs. The
+    /// message is formatted only then, so a guest that keeps poking an
+    /// unmodelled address costs no allocation per exit.
+    fn warn_once(&self, key: Warning, describe: impl FnOnce() -> String) {
+        if self.warned.first(key) {
+            // Outside the lock, so that a slow stderr holds up only this
+            // vCPU.
+            self.log.print(format_args!("{}", describe()));
         }
-        // Outside the lock, so that a slow stderr holds up only this vCPU.
-        self.log.print(format_args!("{message}"));
     }
 
     /// Logs when verbose.
@@ -256,75 +302,95 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-/// Creates the VM.
-fn create_vm() -> Result<Vm> {
-    let start = Instant::now();
-    loop {
-        match Hvf::create_vm(&VmConfig::default()) {
-            Ok(vm) => return Ok(vm),
-            // The previous VM of this process (when `run` is called more
-            // than once) is destroyed once the framework has released its
-            // vCPUs, a few milliseconds after their threads exit.
-            Err(hvf::Error::Hv {
-                call: "hv_vm_destroy",
-                err,
-            }) if err.is_busy() && start.elapsed() < Duration::from_secs(2) => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(hvf::Error::Hv { err, .. }) if err.is_unavailable() => {
-                return Err(format!(
-                    "Hypervisor.framework is unavailable ({err}); is the binary signed with \
-                     the com.apple.security.hypervisor entitlement?"
-                )
-                .into());
-            }
-            Err(e) => return Err(e.into()),
+/// The IPA sizes the framework accepts, smallest first.
+const IPA_SIZES: [u32; 6] = [36, 40, 42, 44, 48, 52];
+
+/// The IPA size for `mem_size` bytes of RAM at [`RAM_BASE`]: `None` (the
+/// framework's default, `default_bits`) when that is enough, otherwise the
+/// smallest larger size up to `max_bits`.
+fn ipa_bits_for(mem_size: u64, default_bits: u32, max_bits: u32) -> Result<Option<u32>> {
+    let too_big = || {
+        let limit = 1u64.checked_shl(max_bits).unwrap_or(u64::MAX);
+        format!(
+            "--mem must be at most {} MiB on this host ({max_bits}-bit IPA)",
+            limit.saturating_sub(RAM_BASE) >> 20
+        )
+    };
+    let last = RAM_BASE.checked_add(mem_size - 1).ok_or_else(too_big)?;
+    let needed = u64::BITS - last.leading_zeros();
+    if needed <= default_bits {
+        return Ok(None);
+    }
+    IPA_SIZES
+        .into_iter()
+        .find(|&bits| bits >= needed && bits <= max_bits)
+        .map(Some)
+        .ok_or_else(|| too_big().into())
+}
+
+/// The IPA size `mem_size` bytes of RAM need on this host.
+fn ipa_bits(mem_size: u64) -> Result<Option<u32>> {
+    match (Hvf::default_ipa_bits(), Hvf::max_ipa_bits()) {
+        (Ok(default), Ok(max)) => ipa_bits_for(mem_size, default, max),
+        // Before macOS 13.0 the IPA size is always 36 bits.
+        (Err(hvf::Error::Unavailable { .. }), _) | (_, Err(hvf::Error::Unavailable { .. })) => {
+            ipa_bits_for(mem_size, 36, 36)
         }
+        (Err(e), _) | (_, Err(e)) => Err(e.into()),
+    }
+}
+
+/// Creates the VM with an IPA size of `ipa_bits` (the default if `None`).
+///
+/// A previous VM of this process (when `run` is called more than once) is
+/// gone by now: its vCPUs were destroyed on their own threads, and the
+/// crate retries `hv_vm_destroy` while the framework finishes releasing
+/// them.
+fn create_vm(ipa_bits: Option<u32>) -> Result<Vm> {
+    match Hvf::create_vm(&VmConfig {
+        ipa_bits,
+        ..Default::default()
+    }) {
+        Ok(vm) => Ok(vm),
+        Err(hvf::Error::Hv { err, .. }) if err.is_unavailable() => Err(format!(
+            "Hypervisor.framework is unavailable ({err}); is the binary signed with the \
+             com.apple.security.hypervisor entitlement?"
+        )
+        .into()),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Forwards console input to the UART, and stops the machine on `Ctrl-A x`.
-fn spawn_input(machine: Weak<Machine>, mut input: Box<dyn Read + Send>) -> Result<()> {
-    const CTRL_A: u8 = 0x01;
-    thread::Builder::new()
-        .name("console-input".into())
-        .spawn(move || {
-            let mut buf = [0u8; 256];
-            let mut escape = false;
-            loop {
-                let n = match input.read(&mut buf) {
-                    Ok(0) => return,
-                    Ok(n) => n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return,
-                };
-                let Some(machine) = machine.upgrade() else {
-                    return;
-                };
-                let mut bytes = Vec::with_capacity(n);
-                for &b in &buf[..n] {
-                    if escape {
-                        escape = false;
-                        match b {
-                            b'x' | b'X' => {
-                                // Not through the UART, so a guest or an
-                                // output that is stuck cannot delay it.
-                                machine.shutdown(Outcome::Quit);
-                                return;
-                            }
-                            CTRL_A => bytes.push(CTRL_A),
-                            _ => bytes.extend_from_slice(&[CTRL_A, b]),
-                        }
-                    } else if b == CTRL_A {
-                        escape = true;
-                    } else {
-                        bytes.push(b);
-                    }
-                }
-                machine.console.receive(&bytes);
+/// The thread stops when the returned value is dropped.
+fn spawn_input(machine: Weak<Machine>, input: OwnedFd) -> Result<input::InputThread> {
+    let mut escape = input::Escape::default();
+    let log_machine = machine.clone();
+    Ok(input::InputThread::spawn(
+        input,
+        move |bytes| {
+            let Some(machine) = machine.upgrade() else {
+                return ControlFlow::Break(());
+            };
+            let mut guest = Vec::with_capacity(bytes.len());
+            let quit = escape.filter(bytes, &mut guest);
+            machine.console.receive(&guest);
+            if quit {
+                // Not through the UART, so a guest or an output that is
+                // stuck cannot delay it.
+                machine.shutdown(Outcome::Quit);
+                return ControlFlow::Break(());
             }
-        })?;
-    Ok(())
+            ControlFlow::Continue(())
+        },
+        move |e| {
+            if let Some(machine) = log_machine.upgrade() {
+                machine.log.print(format_args!(
+                    "console input closed ({e}); Ctrl-A x is unavailable"
+                ));
+            }
+        },
+    )?)
 }
 
 /// Boots the kernel and runs the guest until it powers off or resets.
@@ -347,6 +413,14 @@ pub fn run(cfg: Config) -> Result<Outcome> {
     }
     if cfg.mem_size == 0 || !cfg.mem_size.is_multiple_of(SZ_2M) {
         return Err("--mem must be a non-zero multiple of 2 MiB".into());
+    }
+    let ipa_bits = ipa_bits(cfg.mem_size)?;
+    if !(params.spi_base..params.spi_base.saturating_add(params.spi_count)).contains(&UART_INTID) {
+        return Err(format!(
+            "the UART's INTID {UART_INTID} is outside the GIC's SPI range ({} SPIs from {})",
+            params.spi_count, params.spi_base
+        )
+        .into());
     }
 
     // Guest RAM, unmapped from the VM before it is dropped.
@@ -405,7 +479,7 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         log.print(format_args!("cmdline: {cmdline}"));
     }
 
-    let vm = create_vm()?;
+    let vm = create_vm(ipa_bits)?;
     // SAFETY: `mem` stays mapped until it is unmapped from the guest at the
     // end of this function, and the host accesses it only through
     // vm-memory's volatile accessors.
@@ -417,18 +491,17 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         redistributor_base: GICR_BASE,
         msi: None,
     })?);
-    let uart_intid = params.spi_base + UART_SPI;
     let irq_log = log;
     let console = Pl011::new(
         cfg.output,
         Box::new(move |level| {
-            if let Err(e) = gic.set_spi(uart_intid, level) {
-                irq_log.print(format_args!("cannot set SPI {uart_intid}: {e}"));
+            if let Err(e) = gic.set_spi(UART_INTID, level) {
+                irq_log.print(format_args!("cannot set SPI {UART_INTID}: {e}"));
             }
         }),
     )?;
-    let mut bus = MmioBus::new();
-    bus.register(
+    let mut bus = IoManager::new();
+    bus.register_mmio(
         BusRange::new(MmioAddress(UART_BASE), UART_SIZE)?,
         console.clone(),
     )?;
@@ -440,29 +513,42 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         cpus: psci::Cpus::new(cfg.cpus, entry, placement.dtb),
         kickers: Mutex::new(vec![None; cfg.cpus]),
         outcome: Mutex::new(None),
-        warned: Mutex::new(HashSet::new()),
+        warned: WarnOnce::default(),
         log,
     });
-    if let Some(input) = cfg.input {
-        spawn_input(Arc::downgrade(&machine), input)?;
-    }
+    // Stopped and joined when dropped, before `run` returns.
+    let input = match cfg.input {
+        Some(input) => Some(spawn_input(Arc::downgrade(&machine), input)?),
+        None => None,
+    };
 
-    let order = Arc::new(cpu::CreationOrder::default());
-    let barrier = Arc::new(Barrier::new(cfg.cpus));
+    let gate = Arc::new(cpu::StartGate::new(cfg.cpus));
     let mut threads = Vec::with_capacity(cfg.cpus);
     for index in 0..cfg.cpus {
-        let (machine, order, barrier) = (machine.clone(), order.clone(), barrier.clone());
-        threads.push(
-            thread::Builder::new()
-                .name(format!("vcpu{index}"))
-                .spawn(move || cpu::thread(machine, index, order, barrier))?,
-        );
+        let (m, g) = (machine.clone(), gate.clone());
+        match thread::Builder::new()
+            .name(format!("vcpu{index}"))
+            .spawn(move || cpu::thread(m, index, g))
+        {
+            Ok(t) => threads.push(t),
+            Err(e) => {
+                // Do not return here: the threads already spawned wait at
+                // the gate with their vCPUs, and the VM and its RAM must be
+                // torn down below.
+                machine.fail(format!("cannot spawn the thread of vCPU {index}: {e}"));
+                gate.abort();
+                break;
+            }
+        }
     }
     for (index, t) in threads.into_iter().enumerate() {
         if t.join().is_err() {
             machine.fail(format!("vCPU {index} panicked"));
         }
     }
+    // Before the machine goes, so that the input thread does not hold the
+    // last reference to it.
+    drop(input);
 
     let outcome = machine
         .outcome
@@ -523,6 +609,42 @@ mod tests {
         let mut elf = header();
         elf[0x38] = 0;
         assert!(check_image_header(&elf).is_err());
+    }
+
+    #[test]
+    fn test_warn_once() {
+        let warned = WarnOnce::default();
+        assert!(warned.first(Warning::MmioWrite(0x1000)));
+        assert!(!warned.first(Warning::MmioWrite(0x1000)));
+        // Same address, different kind.
+        assert!(warned.first(Warning::MmioRead(0x1000)));
+        assert!(warned.first(Warning::Vtimer));
+        for addr in 0..WarnOnce::LIMIT as u64 {
+            warned.first(Warning::MmioRead(0x2000 + addr));
+        }
+        // Full: nothing new is logged, and seen keys stay quiet.
+        assert!(!warned.first(Warning::MmioRead(0x9999)));
+        assert!(!warned.first(Warning::MmioWrite(0x1000)));
+        assert_eq!(warned.seen.lock().unwrap().len(), WarnOnce::LIMIT);
+    }
+
+    #[test]
+    fn test_ipa_bits_for() {
+        const G: u64 = 1 << 30;
+        // RAM starts at 2 GiB: 62 GiB fit a 36-bit IPA, more need 40 bits.
+        assert_eq!(ipa_bits_for(512 << 20, 36, 40).unwrap(), None);
+        assert_eq!(ipa_bits_for(62 * G, 36, 40).unwrap(), None);
+        assert_eq!(ipa_bits_for(62 * G + SZ_2M, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(64 * G, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(1022 * G, 36, 40).unwrap(), Some(40));
+        assert_eq!(ipa_bits_for(1023 * G, 36, 42).unwrap(), Some(42));
+        // A larger default is kept.
+        assert_eq!(ipa_bits_for(64 * G, 40, 40).unwrap(), None);
+        // Too big for the host, or for the address space.
+        let e = ipa_bits_for(64 * G, 36, 36).unwrap_err().to_string();
+        assert!(e.contains("at most 63488 MiB"), "{e}");
+        assert!(ipa_bits_for(1023 * G, 36, 40).is_err());
+        assert!(ipa_bits_for(u64::MAX - SZ_2M + 1, 36, 52).is_err());
     }
 
     #[test]

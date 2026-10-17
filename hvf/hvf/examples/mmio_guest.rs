@@ -9,7 +9,7 @@
 //! The example shows the pieces a VMM built on `hvf` puts together:
 //!
 //! - guest RAM from `vm-memory`, mapped into the VM with `Vm::map`;
-//! - MMIO devices on a `vm-device` [`Bus`], reached through data abort exits
+//! - MMIO devices on a `vm-device` [`IoManager`], reached through data abort exits
 //!   that the VMM decodes and completes with `Vcpu::mmio_write_value`,
 //!   `Vcpu::complete_mmio_read` and `Vcpu::advance_pc`;
 //! - a hypercall (`hvc`) that ends the guest, after which the VMM reads the
@@ -27,7 +27,8 @@ mod guest {
 
     use hvf::{DataAbort, ExceptionClass, Hvf, MemoryFlags, Reg, SysReg, Vcpu, VcpuExit, VmConfig};
     use vm_device::DeviceMmio;
-    use vm_device::bus::{Bus, BusRange, MmioAddress, MmioAddressOffset};
+    use vm_device::bus::{BusRange, MmioAddress, MmioAddressOffset};
+    use vm_device::device_manager::{IoManager, MmioManager};
     use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
     /// Guest physical address of the guest RAM, and of the code in it.
@@ -92,10 +93,9 @@ mod guest {
         fn mmio_write(&self, _base: MmioAddress, offset: MmioAddressOffset, data: &[u8]) {
             if offset == 0 {
                 self.output.lock().unwrap().extend_from_slice(&data[..1]);
-                let mut stdout = std::io::stdout().lock();
-                // Printing is best effort.
-                let _ = stdout.write_all(&data[..1]);
-                let _ = stdout.flush();
+                // Printing is best effort. Stdout is line-buffered, so this
+                // costs a write(2) per line rather than per guest byte.
+                let _ = std::io::stdout().write_all(&data[..1]);
             }
         }
     }
@@ -127,12 +127,10 @@ mod guest {
         }
     }
 
-    type MmioBus = Bus<MmioAddress, Arc<dyn DeviceMmio + Send + Sync>>;
-
     /// Emulates one MMIO access and completes the trapped instruction.
     fn handle_mmio(
         vcpu: &mut Vcpu,
-        bus: &MmioBus,
+        bus: &IoManager,
         abort: &DataAbort,
     ) -> Result<(), Box<dyn Error>> {
         // Without an instruction syndrome, the VMM would have to decode the
@@ -141,17 +139,16 @@ mod guest {
             .syndrome
             .ok_or_else(|| format!("data abort at {:#x} without a syndrome", abort.ipa))?;
         let len = usize::from(access.len);
-        let (range, device) = bus
-            .check_access(MmioAddress(abort.ipa), len)
-            .map_err(|e| format!("MMIO access at {:#x} ({len} bytes): {e}", abort.ipa))?;
-        let offset = abort.ipa - range.base().0;
+        let addr = MmioAddress(abort.ipa);
+        let unclaimed = |e| format!("MMIO access at {:#x} ({len} bytes): {e}", abort.ipa);
         if abort.write {
             let value = vcpu.mmio_write_value(&access)?;
-            device.mmio_write(range.base(), offset, &value.to_le_bytes()[..len]);
+            bus.mmio_write(addr, &value.to_le_bytes()[..len])
+                .map_err(unclaimed)?;
             vcpu.advance_pc()?;
         } else {
             let mut bytes = [0u8; 8];
-            device.mmio_read(range.base(), offset, &mut bytes[..len]);
+            bus.mmio_read(addr, &mut bytes[..len]).map_err(unclaimed)?;
             vcpu.complete_mmio_read(&access, u64::from_le_bytes(bytes))?;
         }
         Ok(())
@@ -202,12 +199,12 @@ mod guest {
 
         let console = Arc::new(Console::default());
         let id = Arc::new(IdDevice::default());
-        let mut bus = MmioBus::new();
-        bus.register(
+        let mut bus = IoManager::new();
+        bus.register_mmio(
             BusRange::new(MmioAddress(CONSOLE_BASE), 0x1000)?,
             console.clone(),
         )?;
-        bus.register(BusRange::new(MmioAddress(ID_BASE), 0x1000)?, id.clone())?;
+        bus.register_mmio(BusRange::new(MmioAddress(ID_BASE), 0x1000)?, id.clone())?;
 
         // The vCPU belongs to this thread.
         let mut vcpu = vm.create_vcpu(None)?;

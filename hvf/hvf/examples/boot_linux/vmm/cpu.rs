@@ -3,14 +3,15 @@
 
 //! vCPU threads and the exit loop.
 
-use std::sync::{Arc, Barrier, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use hvf::{DataAbort, Exception, ExceptionClass, Reg, SysReg, Vcpu, VcpuExit};
 use vm_device::bus::MmioAddress;
+use vm_device::device_manager::MmioManager;
 
 use super::psci::{self, Action};
-use super::{Machine, Outcome, Result, sysreg};
+use super::{Machine, Outcome, Result, Warning, sysreg};
 
 /// `CPSR` at entry: EL1h with D, A, I and F masked, as Linux's boot
 /// protocol requires.
@@ -26,28 +27,64 @@ const CNTV_ISTATUS: u64 = 1 << 2;
 /// cannot see them.
 const MAX_WFI_SLEEP: Duration = Duration::from_millis(10);
 
-/// Hands out the turns in which the vCPU threads create their vCPUs.
+/// Holds the vCPU threads until every vCPU exists, so that all
+/// redistributors are in place before vCPU 0 boots the kernel.
 ///
-/// The framework marks the redistributor of the most recently created vCPU
-/// as the last one (`GICR_TYPER.Last`), and Linux stops scanning there.
-/// Creating the vCPUs in index order keeps the last frame at the end.
-#[derive(Debug, Default)]
-pub struct CreationOrder {
-    next: Mutex<usize>,
-    turn: Condvar,
+/// Unlike a `Barrier`, it can be opened early with [`StartGate::abort`],
+/// for example when a later vCPU thread cannot be spawned, so that the
+/// threads already waiting drop their vCPUs and exit.
+///
+/// The order in which the vCPUs are created does not matter. The framework
+/// gives each new vCPU the lowest free id, places the redistributor of id
+/// `n` at frame `n` and sets `GICR_TYPER.Last` on the frame of the highest
+/// id. Linux finds each CPU's frame by its affinity (`MPIDR_EL1`).
+#[derive(Debug)]
+pub struct StartGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
 }
 
-impl CreationOrder {
-    fn wait_turn(&self, index: usize) {
-        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-        while *next != index {
-            next = self.turn.wait(next).unwrap_or_else(PoisonError::into_inner);
+#[derive(Debug)]
+struct GateState {
+    /// Threads that have yet to arrive.
+    missing: usize,
+    aborted: bool,
+}
+
+impl StartGate {
+    /// A gate that opens once `threads` threads have arrived.
+    pub fn new(threads: usize) -> StartGate {
+        StartGate {
+            state: Mutex::new(GateState {
+                missing: threads,
+                aborted: false,
+            }),
+            changed: Condvar::new(),
         }
     }
 
-    fn done(&self) {
-        *self.next.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-        self.turn.notify_all();
+    /// Waits until every thread has arrived (`true`) or the gate is
+    /// aborted (`false`).
+    pub fn arrive_and_wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.missing = state.missing.saturating_sub(1);
+        self.changed.notify_all();
+        while state.missing > 0 && !state.aborted {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        !state.aborted
+    }
+
+    /// Releases the waiting threads with `false`; no more will arrive.
+    pub fn abort(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .aborted = true;
+        self.changed.notify_all();
     }
 }
 
@@ -80,22 +117,19 @@ fn create(machine: &Machine, index: usize) -> Result<Vcpu> {
 
 /// The body of vCPU thread `index`.
 ///
-/// Every thread creates its vCPU, in index order, and then waits at
-/// `barrier`, so that all redistributors exist before vCPU 0 runs. vCPU 0
-/// then boots the kernel; the others wait for `CPU_ON`.
-pub fn thread(
-    machine: Arc<Machine>,
-    index: usize,
-    order: Arc<CreationOrder>,
-    barrier: Arc<Barrier>,
-) {
-    order.wait_turn(index);
+/// Every thread creates its vCPU and then waits at `gate`, so that all
+/// redistributors exist before vCPU 0 runs. vCPU 0 then boots the kernel;
+/// the others wait for `CPU_ON`.
+pub fn thread(machine: Arc<Machine>, index: usize, gate: Arc<StartGate>) {
     let created = create(&machine, index);
     if let Ok(vcpu) = &created {
         machine.register_kicker(index, vcpu.kicker());
     }
-    order.done();
-    barrier.wait();
+    if !gate.arrive_and_wait() {
+        // The machine never started. The vCPU is dropped here, on its
+        // own thread.
+        return;
+    }
 
     let result = created.and_then(|mut vcpu| {
         machine.log_vcpu(index, &vcpu);
@@ -168,7 +202,9 @@ fn run(machine: &Machine, index: usize, vcpu: &mut Vcpu) -> Result<Stop> {
             VcpuExit::VtimerActivated => {
                 // Only without the in-kernel GIC, which delivers the timer
                 // interrupt (PPI 27) itself.
-                machine.warn_once("unexpected VtimerActivated exit".to_string());
+                machine.warn_once(Warning::Vtimer, || {
+                    "unexpected VtimerActivated exit".to_string()
+                });
                 vtimer_masked = true;
                 continue;
             }
@@ -252,30 +288,30 @@ fn mmio(
         .into());
     };
     let len = usize::from(access.len);
-    let device = machine.bus.check_access(MmioAddress(abort.ipa), len).ok();
+    let addr = MmioAddress(abort.ipa);
+    // An access that no device claims fails before touching `bytes`: writes
+    // are dropped and reads return zero.
     if abort.write {
         let value = vcpu.mmio_write_value(&access)?;
-        match device {
-            Some((range, dev)) => {
-                dev.mmio_write(
-                    range.base(),
-                    abort.ipa - range.base().0,
-                    &value.to_le_bytes()[..len],
-                );
-            }
-            None => machine.warn_once(format!(
-                "ignored {len}-byte MMIO write of {value:#x} to {:#x}",
-                abort.ipa
-            )),
+        if machine
+            .bus
+            .mmio_write(addr, &value.to_le_bytes()[..len])
+            .is_err()
+        {
+            machine.warn_once(Warning::MmioWrite(abort.ipa), || {
+                format!(
+                    "ignored {len}-byte MMIO write of {value:#x} to {:#x}",
+                    abort.ipa
+                )
+            });
         }
         vcpu.advance_pc()?;
     } else {
         let mut bytes = [0u8; 8];
-        match device {
-            Some((range, dev)) => {
-                dev.mmio_read(range.base(), abort.ipa - range.base().0, &mut bytes[..len]);
-            }
-            None => machine.warn_once(format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa)),
+        if machine.bus.mmio_read(addr, &mut bytes[..len]).is_err() {
+            machine.warn_once(Warning::MmioRead(abort.ipa), || {
+                format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa)
+            });
         }
         vcpu.complete_mmio_read(&access, u64::from_le_bytes(bytes))?;
     }
@@ -321,6 +357,36 @@ fn dump(vcpu: &Vcpu, exception: &Exception) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_start_gate() {
+        use std::thread;
+
+        let gate = Arc::new(StartGate::new(3));
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let gate = gate.clone();
+                thread::spawn(move || gate.arrive_and_wait())
+            })
+            .collect();
+        for w in waiters {
+            assert!(w.join().unwrap());
+        }
+
+        // Two of three threads arrive, the third is never spawned.
+        let gate = Arc::new(StartGate::new(3));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = gate.clone();
+                thread::spawn(move || gate.arrive_and_wait())
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(20));
+        gate.abort();
+        for w in waiters {
+            assert!(!w.join().unwrap());
+        }
+    }
 
     #[test]
     fn test_pa_range() {

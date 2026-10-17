@@ -18,6 +18,9 @@
 # executed.
 
 set -eu
+# `cd` with a relative path consults an exported CDPATH, and then prints the
+# directory (or fails), which breaks the `$(cd ... && pwd)` lines below.
+unset CDPATH
 
 # --- Pins. To move to a newer kernel, update all of these together. -------
 KVER=6.12.111+deb13-cloud-arm64

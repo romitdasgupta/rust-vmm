@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vm_device::DeviceMmio;
 use vm_device::bus::{MmioAddress, MmioAddressOffset};
@@ -64,6 +64,11 @@ const TX_BUFFER: usize = 64 * 1024;
 /// The transmit interrupt is raised while the queue holds at most this many
 /// bytes, like the FIFO level trigger of the real UART.
 const TX_LOW: usize = TX_BUFFER / 2;
+/// The output thread writes as soon as this many bytes are queued...
+const TX_BATCH: usize = 1024;
+/// ...or a line is complete, or this long after the first queued byte.
+/// Without it, the thread wakes and writes for about every byte.
+const TX_LINGER: Duration = Duration::from_millis(2);
 
 /// `UARTPeriphID0-3` and `UARTPCellID0-3`: an ARM PL011 r1p5.
 const ID: [u8; 8] = [0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
@@ -104,6 +109,8 @@ struct TxState {
     bytes: VecDeque<u8>,
     /// The output thread is writing bytes it took off the queue.
     writing: bool,
+    /// A newline was queued since the output thread last took the bytes.
+    newline: bool,
     /// A byte was queued above [`TX_LOW`], which cleared the transmit
     /// interrupt; raise it again once the queue drains.
     raise_tx: bool,
@@ -158,6 +165,19 @@ fn write_output(uart: Weak<Pl011>, tx: Arc<TxQueue>, mut out: Sink) {
             if state.bytes.is_empty() {
                 return;
             }
+            // Collect a whole line, or a batch, before writing.
+            let deadline = Instant::now() + TX_LINGER;
+            while !state.closed && !state.newline && state.bytes.len() < TX_BATCH {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                state = tx
+                    .queued
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            state.newline = false;
             chunk.clear();
             chunk.extend(state.bytes.drain(..));
             state.writing = true;
@@ -215,10 +235,17 @@ impl Pl011 {
         !wait.timed_out()
     }
 
-    /// The output thread emptied the queue: raise the transmit interrupt.
+    /// The output thread emptied the queue: raise the transmit interrupt,
+    /// unless the guest has refilled the queue past [`TX_LOW`] in the
+    /// meantime. That refill cleared the interrupt and asked for it again
+    /// on the next drain, and raising it now, maybe with `FR.TXFF` set,
+    /// would make Linux's interrupt handler write into a full queue and
+    /// lose the bytes.
     fn tx_drained(&self) {
         let mut regs = self.lock();
-        regs.ris |= INT_TX;
+        if self.tx.lock().bytes.len() <= TX_LOW {
+            regs.ris |= INT_TX;
+        }
         self.update(&mut regs);
     }
 
@@ -255,7 +282,12 @@ impl Pl011 {
             // The guest ignored FR.TXFF; the byte is lost, as on hardware.
             return;
         }
+        let was_empty = tx.bytes.is_empty();
         tx.bytes.push_back(byte);
+        tx.newline |= byte == b'\n';
+        // Wake the output thread only when it has something to do: it
+        // waits for the first byte, then for a line end or a full batch.
+        let wake = was_empty || byte == b'\n' || tx.bytes.len() == TX_BATCH;
         if tx.bytes.len() <= TX_LOW {
             regs.ris |= INT_TX;
         } else {
@@ -264,7 +296,9 @@ impl Pl011 {
             tx.raise_tx = true;
         }
         drop(tx);
-        self.tx.queued.notify_one();
+        if wake {
+            self.tx.queued.notify_one();
+        }
     }
 
     /// Recomputes the receive interrupts and the interrupt line. Called with
@@ -521,6 +555,71 @@ mod tests {
         let out = out.0.lock().unwrap();
         assert_eq!(out.len(), 1 + TX_BUFFER);
         assert!(!out.contains(&b'c'));
+    }
+
+    #[test]
+    fn test_tx_drained_while_refilled() {
+        // The output thread took the queue and is about to raise the
+        // transmit interrupt, but the guest has filled the queue again.
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (uart, _) = uart_with(Box::new(Stuck {
+            entered: entered_tx,
+            release: release_rx,
+            out: Buf::default(),
+        }));
+        write32(&uart, IMSC, INT_TX);
+        write32(&uart, DR, u32::from(b'a'));
+        entered.recv().unwrap();
+        for _ in 0..TX_BUFFER {
+            write32(&uart, DR, u32::from(b'b'));
+        }
+        assert_eq!(read32(&uart, FR) & FR_TXFF, FR_TXFF);
+        uart.tx_drained();
+        assert_eq!(
+            read32(&uart, RIS) & INT_TX,
+            0,
+            "TX raised while TXFF is set"
+        );
+        // The real drain raises it.
+        drop(release);
+        assert!(uart.flush(Duration::from_secs(5)));
+        assert_eq!(read32(&uart, RIS) & INT_TX, INT_TX);
+    }
+
+    #[test]
+    fn test_tx_batches_lines() {
+        /// Records the size of every write.
+        #[derive(Clone, Default)]
+        struct Writes(Arc<Mutex<Vec<usize>>>);
+        impl Write for Writes {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push(data.len());
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let total = Writes::default();
+        let (uart, _) = uart_with(Box::new(total.clone()));
+        let lines = 50;
+        for _ in 0..lines {
+            for &b in b"0123456789abcdef\n" {
+                write32(&uart, DR, u32::from(b));
+            }
+        }
+        assert!(uart.flush(Duration::from_secs(5)));
+        let writes = total.0.lock().unwrap();
+        assert_eq!(writes.iter().sum::<usize>(), lines * 17);
+        // About one write per line, not one per byte.
+        assert!(writes.len() <= lines + 1, "{} writes", writes.len());
+
+        // A partial line still goes out, after TX_LINGER.
+        drop(writes);
+        write32(&uart, DR, u32::from(b'$'));
+        assert!(uart.flush(Duration::from_secs(5)));
+        assert_eq!(*total.0.lock().unwrap().last().unwrap(), 1);
     }
 
     #[test]

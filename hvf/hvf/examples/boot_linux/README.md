@@ -270,7 +270,8 @@ prompt asks the terminal a question that a script should answer.
 
 `hvf.autopoweroff` makes the busybox `/init` power off right after its
 greeting. `--cmdline` replaces the whole default command line, so repeat
-the console settings:
+the console settings (the PL011 is the console even without them, but
+`earlycon` is what shows the first kernel messages):
 
 ```sh
 cargo run --release -p hvf --features vm-memory --example boot_linux -- \
@@ -394,7 +395,8 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; fin
 ```
 
 Add `--nocapture` after `--ignored` to see the console output of both
-boots. Without the variables, the test prints `SKIP` and passes.
+boots. Without the variables (or with a misspelled one), the test fails
+instead of passing without booting anything.
 
 ## Reference
 
@@ -410,7 +412,7 @@ boot_linux --kernel <Image> [--initrd <file>] [--cmdline <args>]
 | `--kernel <Image>` | required | Uncompressed arm64 Linux `Image` |
 | `--initrd <file>` | none | Initramfs, for example a gzip'd newc cpio archive |
 | `--cmdline <args>` | `console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 panic=-1` | Kernel command line; replaces the default entirely |
-| `--mem <size>` | `512M` | RAM size, a multiple of 2 MiB, with an optional `K`, `M` or `G` suffix. A bare number is MiB |
+| `--mem <size>` | `512M` | RAM size, a multiple of 2 MiB, with an optional `K`, `M` or `G` suffix. A bare number is MiB. RAM starts at 2 GiB, so more than 62 GiB needs a larger IPA space than the default 36 bits; the VMM then asks for one, up to the host's maximum (`Hvf::max_ipa_bits`) |
 | `--cpus <n>` | `1` | Number of vCPUs, from 1 to the host's limit, which the error for a too large value names (64 on the Mac this guide was tested on) |
 | `--verbose`, `-v` | off | Log the memory layout, PSCI calls and vCPU power state changes to stderr |
 | `--help`, `-h` | | Print the usage |
@@ -423,7 +425,7 @@ the device tree in the last 2 MiB.
 
 | Parameter | Effect |
 |---|---|
-| `console=ttyAMA0` | The PL011 is the console, and `/dev/console` for init. Without it, nothing appears after early boot |
+| `console=ttyAMA0` | The PL011 is the console, and `/dev/console` for init. The device tree's `/chosen/stdout-path` already selects the PL011 when no `console=` is given; naming it keeps `earlycon` from printing the early messages twice |
 | `earlycon=pl011,mmio32,0x9000000` | Kernel messages from the very start, before the PL011 driver loads |
 | `panic=-1` | Reboot at once on a panic. The VMM exits with status 3 instead of hanging |
 | `hvf.autopoweroff` | The busybox `/init` powers off after its greeting instead of starting a shell |
@@ -471,6 +473,12 @@ The complete output of a boot with the Rust `/init` on 2 vCPUs
 [boot_linux] vCPU 0: PSCI 0x84000008(0x0, 0x0, 0x0) -> SystemOff
 [boot_linux] guest stopped: Ok(PowerOff)
 ```
+
+The vCPU threads create their vCPUs concurrently, and the framework
+numbers them in creation order, so `id` and the redistributor frame need
+not match the vCPU index. That is fine: Linux finds each CPU's
+redistributor by its affinity (`MPIDR`), and `GICR_TYPER.Last` is always
+on the frame of the highest id.
 
 The end of the initrd depends on the size of the initramfs, and the lines of
 different vCPUs can come in a different order. The first `PSCI` calls are
@@ -641,8 +649,10 @@ points to the console settings:
 - The kernel has no PL011 driver, or has it as a module. Firecracker's CI
   kernels, for example, boot and power off without printing anything. Check
   the options in [Requirements](#requirements).
-- `--cmdline` lacks `console=ttyAMA0`, or names another console such as
-  `console=ttyS0`. Remember that `--cmdline` replaces the whole default.
+- `--cmdline` names another console, such as `console=ttyS0`, and not
+  `console=ttyAMA0`. Remember that `--cmdline` replaces the whole default.
+  Without any `console=`, the device tree's `stdout-path` makes the PL011
+  the console.
 - Add `earlycon=pl011,mmio32,0x9000000` to see messages from the first
   instruction on, and `--verbose` to see the PSCI calls that prove the guest
   is running.
@@ -690,15 +700,17 @@ needs.
 the network, then see
 [Updating the pinned downloads](#updating-the-pinned-downloads).
 
-**`^[[6n` after the prompt, or slow commands, when a script drives the
+**`^[[6n` after the prompt, or `expect` timeouts, when a script drives the
 shell.** Each time the busybox shell prints its prompt, it asks the terminal
 for the cursor position with `ESC [ 6 n`. A real terminal answers at once
 and shows nothing, so at the keyboard you never notice. A program that
 drives the console through a pty (`expect`, `script`, a CI job) sees the
 bytes `ESC[6n` right after `~ # ` and does not answer. With `script` fed
-from a pipe that only leaves the stray bytes in the log. With `expect`
-waiting for `"~ # "`, each command ran only when that `expect` reached its
-timeout, so every command took about as long as `set timeout`.
+from a pipe that only leaves the stray bytes in the log. Busybox does not
+wait for the answer, so a plain `expect "~ # "` still matches and the
+commands run at once. A pattern anchored at the end, such as
+`-re {~ # $}`, usually misses the prompt because `ESC[6n` follows it in the
+same read, and that `expect` then waits for its full `set timeout`.
 
 Wait for the prompt together with the query and answer it, here with row
 24, column 5 (the prompt `~ # ` is 4 characters wide):
@@ -717,7 +729,7 @@ send "exit\r"
 expect eof
 ```
 
-The commands then run at once. Answer with a row other than 1: busybox
+Each `expect` then matches as soon as the prompt appears. Answer with a row other than 1: busybox
 can take `ESC[1;5R` for a function key (`Ctrl-F3`) and lose the input that
 follows. Setting `TERM=dumb` does not help; this busybox sends the query
 anyway. With `script`, feed the keys through a pipe and give the guest time
@@ -739,5 +751,6 @@ If the run needs no shell, boot with `hvf.autopoweroff` (see
 `/init` instead.
 
 **The terminal behaves oddly after the VMM was killed.** The VMM restores
-the terminal when it exits normally, but not after `kill -9`. Type `reset`
-(or `stty sane`) and press Enter.
+the terminal when it exits, and also when `SIGTERM`, `SIGHUP`, `SIGINT` or
+`SIGQUIT` ends it, but nothing can after `kill -9` (`SIGKILL`). Type
+`reset` (or `stty sane`) and press Enter.
