@@ -16,6 +16,16 @@ use std::time::{Duration, Instant};
 use common::hv_guard;
 use hvf::{Error, Hvf, IpaGranule, VmConfig};
 
+/// The IPA size probes need macOS 13.0; older releases always use a 36-bit
+/// IPA. Returns `None` there.
+fn ipa_probe(probe: hvf::Result<u32>) -> Option<u32> {
+    match probe {
+        Ok(bits) => Some(bits),
+        Err(Error::Unavailable { since: (13, 0), .. }) => None,
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
 /// Retries `create_vm` while the previous VM is still being torn down by the
 /// framework (`hv_vm_destroy` failing with `HV_BUSY`), for at most `limit`.
 fn create_vm_within(cfg: &VmConfig, limit: Duration) -> hvf::Vm {
@@ -44,7 +54,7 @@ fn test_second_vm_fails() {
     );
     // Any configuration is rejected while a VM is alive.
     let cfg = VmConfig {
-        ipa_bits: Some(Hvf::max_ipa_bits().unwrap()),
+        ipa_bits: Some(ipa_probe(Hvf::max_ipa_bits()).unwrap_or(36)),
         ..Default::default()
     };
     assert_eq!(Hvf::create_vm(&cfg).unwrap_err(), Error::VmExists);
@@ -69,7 +79,10 @@ fn test_drop_and_recreate() {
     }
     // The effective configuration is reported.
     let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-    assert_eq!(vm.ipa_bits(), Hvf::default_ipa_bits().unwrap());
+    assert_eq!(
+        vm.ipa_bits(),
+        ipa_probe(Hvf::default_ipa_bits()).unwrap_or(36)
+    );
     let granule = match Hvf::default_ipa_granule() {
         Ok(g) => g,
         Err(Error::Unavailable { .. }) => IpaGranule::K16,
@@ -114,8 +127,13 @@ fn test_vm_kept_alive_by_vcpu_on_other_thread() {
 #[test]
 fn test_ipa_bits() {
     let Some(_g) = hv_guard() else { return };
-    let max = Hvf::max_ipa_bits().unwrap();
-    let default = Hvf::default_ipa_bits().unwrap();
+    let (Some(max), Some(default)) = (
+        ipa_probe(Hvf::max_ipa_bits()),
+        ipa_probe(Hvf::default_ipa_bits()),
+    ) else {
+        println!("SKIP: the IPA size probes need macOS 13.0");
+        return;
+    };
     assert!(default <= max, "default {default} > max {max}");
 
     let cfg = VmConfig {
@@ -149,8 +167,11 @@ fn test_ipa_granule_and_el2_configs() {
         };
         match Hvf::create_vm(&cfg) {
             Ok(vm) => assert_eq!(vm.ipa_granule(), granule.bytes()),
-            // The granule setter needs macOS 26.0.
-            Err(Error::Unavailable { since: (26, 0), .. }) => {}
+            // The granule setter needs macOS 26.0, VM configurations 13.0.
+            Err(Error::Unavailable {
+                since: (26, 0) | (13, 0),
+                ..
+            }) => {}
             Err(e) => panic!("{granule:?}: {e:?}"),
         }
     }
