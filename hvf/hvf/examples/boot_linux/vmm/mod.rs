@@ -103,7 +103,10 @@ struct Log {
 impl Log {
     fn print(&self, args: fmt::Arguments<'_>) {
         let eol = if self.raw { "\r\n" } else { "\n" };
-        eprint!("[boot_linux] {args}{eol}");
+        // Best effort, like the console: a closed stderr (`2>&1 | head`)
+        // must not panic a vCPU thread, as `eprint!` would, and stop the
+        // guest.
+        let _ = write!(std::io::stderr().lock(), "[boot_linux] {args}{eol}");
     }
 }
 
@@ -159,11 +162,15 @@ impl Machine {
 
     /// Logs `message` the first time it occurs.
     fn warn_once(&self, message: String) {
-        let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
-        if warned.len() < 64 && !warned.contains(&message) {
-            self.log.print(format_args!("{message}"));
-            warned.insert(message);
+        {
+            let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
+            if warned.len() >= 64 || warned.contains(&message) {
+                return;
+            }
+            warned.insert(message.clone());
         }
+        // Outside the lock, so that a slow stderr holds up only this vCPU.
+        self.log.print(format_args!("{message}"));
     }
 
     /// Logs when verbose.
@@ -220,9 +227,19 @@ fn load_kernel(mem: &GuestMemoryMmap, path: &Path) -> Result<(u64, u64)> {
     file.rewind()?;
     let loaded = PE::load(mem, Some(GuestAddress(RAM_BASE)), &mut file, None)?;
     let entry = loaded.kernel_load.raw_value();
-    // `kernel_end` only covers the file.
-    let end = loaded.kernel_end.max(entry + image_size);
-    Ok((entry, layout::align_up(end, SZ_2M)))
+    // `kernel_end` only covers the file. `image_size` comes from the file, so
+    // a corrupt header must not overflow.
+    let end = entry
+        .checked_add(image_size)
+        .map(|end| end.max(loaded.kernel_end))
+        .and_then(|end| end.checked_next_multiple_of(SZ_2M))
+        .ok_or_else(|| {
+            format!(
+                "{}: invalid image_size {image_size:#x} in the Image header",
+                path.display()
+            )
+        })?;
+    Ok((entry, end))
 }
 
 /// Builds the command line with `linux-loader`, which validates it.

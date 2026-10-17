@@ -29,6 +29,7 @@ mod vmm;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod cli {
+    use std::io::Write;
     use std::path::PathBuf;
 
     use super::vmm::{self, Config, Outcome};
@@ -186,24 +187,16 @@ Ctrl-A x stops the VMM.";
         });
         drop(raw);
 
-        match result {
-            Ok(Outcome::PowerOff) => {
-                eprintln!("boot_linux: the guest powered off");
-                0
-            }
-            Ok(Outcome::Reset) => {
-                eprintln!("boot_linux: the guest requested a reset");
-                3
-            }
-            Ok(Outcome::Quit) => {
-                eprintln!("boot_linux: stopped by Ctrl-A x");
-                130
-            }
-            Err(e) => {
-                eprintln!("boot_linux: {e}");
-                1
-            }
-        }
+        let (status, message) = match result {
+            Ok(Outcome::PowerOff) => (0, "the guest powered off".to_string()),
+            Ok(Outcome::Reset) => (3, "the guest requested a reset".to_string()),
+            Ok(Outcome::Quit) => (130, "stopped by Ctrl-A x".to_string()),
+            Err(e) => (1, e.to_string()),
+        };
+        // `eprintln!` would panic (exit status 101) if stderr is a pipe whose
+        // reader is gone, as in `boot_linux ... 2>&1 | head`.
+        let _ = writeln!(std::io::stderr(), "boot_linux: {message}");
+        status
     }
 
     #[cfg(test)]
@@ -250,5 +243,12 @@ fn main() {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn main() {
-    eprintln!("This example requires macOS on Apple silicon.");
+    // Not 0, which means that the guest powered off.
+    eprintln!(
+        "boot_linux: this example must be built for aarch64-apple-darwin (macOS on Apple \
+         silicon); this build targets {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    std::process::exit(1);
 }

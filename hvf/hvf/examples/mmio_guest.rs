@@ -158,12 +158,19 @@ mod guest {
     }
 
     pub fn run() -> Result<(), Box<dyn Error>> {
+        // The IPA size probes need macOS 13.0; older releases always use a
+        // 36-bit IPA, and nothing else here needs more than macOS 11.0.
+        let ipa = match (Hvf::max_ipa_bits(), Hvf::default_ipa_bits()) {
+            (Ok(max), Ok(default)) => format!("{max}-bit IPA (default {default})"),
+            (Err(hvf::Error::Unavailable { .. }), _) | (_, Err(hvf::Error::Unavailable { .. })) => {
+                "36-bit IPA".to_string()
+            }
+            (Err(e), _) | (_, Err(e)) => return Err(e.into()),
+        };
         println!(
-            "host: page size {:#x}, up to {} vCPUs, {}-bit IPA (default {})",
+            "host: page size {:#x}, up to {} vCPUs, {ipa}",
             Hvf::host_page_size(),
             Hvf::max_vcpu_count()?,
-            Hvf::max_ipa_bits()?,
-            Hvf::default_ipa_bits()?,
         );
 
         // The guest RAM is created first so that it outlives the VM.
@@ -263,5 +270,11 @@ fn main() {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn main() {
-    eprintln!("This example requires macOS on Apple silicon.");
+    eprintln!(
+        "mmio_guest: this example must be built for aarch64-apple-darwin (macOS on Apple \
+         silicon); this build targets {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    std::process::exit(1);
 }

@@ -427,7 +427,7 @@ the device tree in the last 2 MiB.
 | `earlycon=pl011,mmio32,0x9000000` | Kernel messages from the very start, before the PL011 driver loads |
 | `panic=-1` | Reboot at once on a panic. The VMM exits with status 3 instead of hanging |
 | `hvf.autopoweroff` | The busybox `/init` powers off after its greeting instead of starting a shell |
-| `rdinit=/bin/sh` | Skip `/init` and run the busybox shell as PID 1. Nothing is mounted and only shell builtins work until you run `/bin/busybox --install -s`; leave with `busybox poweroff -f` |
+| `rdinit=/bin/sh` | Skip `/init` and run the busybox shell as PID 1. Nothing is mounted and only shell builtins work until you run `/bin/busybox --install -s /bin` (the archive has only `/bin`, so a plain `--install -s` cannot create the `/sbin` and `/usr` links); leave with `busybox poweroff -f` |
 | `quiet` or `loglevel=N` | Fewer kernel messages |
 
 ### Keys
@@ -620,8 +620,13 @@ running `cargo` from outside the repository, or overriding
 `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER`.
 
 **`HV_UNSUPPORTED` or `HV_NO_DEVICE` in the same message.** The host cannot
-run VMs: an Intel Mac, or macOS running in a VM without nested
-virtualization. `sysctl kern.hv_support` prints 0.
+run VMs, for example macOS running in a VM without nested virtualization.
+`sysctl kern.hv_support` prints 0 or fails.
+
+**`boot_linux: this example must be built for aarch64-apple-darwin`.** The
+example was built for another target, for example on an Intel Mac or with an
+x86_64 Rust toolchain on Apple silicon. `rustc -vV` must show
+`host: aarch64-apple-darwin`.
 
 **`boot_linux: this example needs the in-kernel GICv3 of macOS 15.0 or newer`.**
 The host runs macOS 11 to 14. The `hvf` crate itself works there, but this

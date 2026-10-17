@@ -241,7 +241,11 @@ impl Pl011 {
     /// receiver in loopback mode). Never blocks.
     fn transmit(&self, regs: &mut Regs, byte: u8) {
         if regs.cr & CR_LBE != 0 {
-            regs.rx.push_back(byte);
+            // Bounded like `receive`, so a guest that loops bytes back
+            // without reading them cannot grow the VMM's memory.
+            if regs.rx.len() < RX_BUFFER {
+                regs.rx.push_back(byte);
+            }
             // The byte left the (empty) FIFO at once.
             regs.ris |= INT_TX;
             return;
@@ -526,5 +530,16 @@ mod tests {
         write32(&uart, DR, 0x55);
         assert!(out.0.lock().unwrap().is_empty());
         assert_eq!(read32(&uart, DR), 0x55);
+
+        // Bytes the guest does not read back are dropped beyond RX_BUFFER.
+        for _ in 0..RX_BUFFER + 16 {
+            write32(&uart, DR, 0x66);
+        }
+        let mut looped = 0;
+        while read32(&uart, FR) & FR_RXFE == 0 {
+            assert_eq!(read32(&uart, DR), 0x66);
+            looped += 1;
+        }
+        assert_eq!(looped, RX_BUFFER);
     }
 }
