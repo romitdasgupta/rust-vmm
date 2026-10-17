@@ -24,6 +24,10 @@ The same change makes the existing workspace build and test on
 `vm-memory` and `virtio-blk` get small portability fixes. Linux behaviour is
 unchanged.
 
+It also adds a `boot_linux` example to `hvf`: a small VMM that boots arm64
+Linux to a shell on the in-kernel GICv3, with a step-by-step guide and an
+opt-in boot test.
+
 ## Motivation
 
 - **Demand.** Several Rust VMMs already run on Apple silicon through HVF:
@@ -152,8 +156,7 @@ doctests.
    by naked functions.
 6. **Follow-ups**, each as a separate PR: a kqueue backend for
    `event-manager`; `F_PUNCHHOLE` support in `vmm-sys-util`, so that
-   virtio-blk's stdio backend works on macOS; SME accessors; and a
-   `boot_linux` example.
+   virtio-blk's stdio backend works on macOS; and SME accessors.
 
 ## Maintainers
 
