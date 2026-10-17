@@ -98,6 +98,25 @@ pub struct SysReg(pub hv::hv_sys_reg_t);
 // same `op0:op1:CRn:CRm:op2` layout as `hv_sys_reg_t`.
 const KVM_ARM64_SYSREG_ID_BASE: u64 = 0x6000_0000_0000_0000 | 0x0030_0000_0000_0000 | 0x0013 << 16;
 
+// `KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE`. The low bits of a core
+// register id are its offset in `struct kvm_regs` in 32-bit words.
+const KVM_ARM64_CORE_ID_BASE: u64 = 0x6000_0000_0000_0000 | 0x0030_0000_0000_0000 | 0x0010 << 16;
+
+/// The system registers KVM exposes only as `KVM_REG_ARM_CORE` registers,
+/// with their core ids. `struct kvm_regs` starts with `struct user_pt_regs`
+/// (`regs[31]`, `sp`, `pc`, `pstate`), followed by `sp_el1`, `elr_el1` and
+/// `spsr[]`, whose element `KVM_SPSR_EL1` (0) is `SPSR_EL1`.
+const KVM_CORE_SYS_REGS: [(SysReg, u64); 4] = [
+    // `regs.sp`: byte offset 31 * 8.
+    (SysReg::SP_EL0, KVM_ARM64_CORE_ID_BASE | 0x3e),
+    // `sp_el1`: byte offset 34 * 8.
+    (SysReg::SP_EL1, KVM_ARM64_CORE_ID_BASE | 0x44),
+    // `elr_el1`: byte offset 35 * 8.
+    (SysReg::ELR_EL1, KVM_ARM64_CORE_ID_BASE | 0x46),
+    // `spsr[KVM_SPSR_EL1]`: byte offset 36 * 8.
+    (SysReg::SPSR_EL1, KVM_ARM64_CORE_ID_BASE | 0x48),
+];
+
 /// Converts between a system register encoding and the low 16 bits of its
 /// KVM one-reg id, which are the same except for two registers: the Linux
 /// uapi defines `KVM_REG_ARM_TIMER_CVAL` as `ARM64_SYS_REG(3, 3, 14, 0, 2)`
@@ -160,14 +179,32 @@ impl SysReg {
     /// Like KVM, this maps `KVM_REG_ARM_TIMER_CVAL` to `CNTV_CVAL_EL0` and
     /// `KVM_REG_ARM_TIMER_CNT` to `CNTVCT_EL0`: the Linux uapi defines those
     /// two ids with each other's encodings.
+    ///
+    /// KVM has no system register ids for `SP_EL0`, `SP_EL1`, `ELR_EL1` and
+    /// `SPSR_EL1`; it exposes them as `KVM_REG_ARM_CORE` registers
+    /// (`regs.sp`, `sp_el1`, `elr_el1` and `spsr[KVM_SPSR_EL1]` of
+    /// `struct kvm_regs`). Those four core ids map to these registers, and
+    /// their encodings in the system register space map to `None`.
     pub fn from_kvm_one_reg_id(id: u64) -> Option<SysReg> {
-        (id & !0xffff == KVM_ARM64_SYSREG_ID_BASE).then_some(SysReg(kvm_swap_timer(id as u16)))
+        if let Some(&(reg, _)) = KVM_CORE_SYS_REGS.iter().find(|&&(_, core)| core == id) {
+            return Some(reg);
+        }
+        if id & !0xffff != KVM_ARM64_SYSREG_ID_BASE {
+            return None;
+        }
+        let reg = SysReg(kvm_swap_timer(id as u16));
+        (!KVM_CORE_SYS_REGS.iter().any(|&(r, _)| r == reg)).then_some(reg)
     }
 
-    /// The equivalent KVM `KVM_REG_ARM64_SYSREG` one-reg id, with KVM's
-    /// swapped timer ids (see [`from_kvm_one_reg_id`](Self::from_kvm_one_reg_id)).
+    /// The equivalent KVM one-reg id: a `KVM_REG_ARM64_SYSREG` id, with KVM's
+    /// swapped timer ids, or the `KVM_REG_ARM_CORE` id of `SP_EL0`, `SP_EL1`,
+    /// `ELR_EL1` and `SPSR_EL1` (see
+    /// [`from_kvm_one_reg_id`](Self::from_kvm_one_reg_id)).
     pub fn to_kvm_one_reg_id(self) -> u64 {
-        KVM_ARM64_SYSREG_ID_BASE | u64::from(kvm_swap_timer(self.0))
+        match KVM_CORE_SYS_REGS.iter().find(|&&(reg, _)| reg == self) {
+            Some(&(_, core)) => core,
+            None => KVM_ARM64_SYSREG_ID_BASE | u64::from(kvm_swap_timer(self.0)),
+        }
     }
 }
 
@@ -629,8 +666,32 @@ mod tests {
             assert_eq!(SysReg::from_kvm_one_reg_id(id), Some(info.reg));
         }
 
-        // KVM_REG_ARM_CORE register (regs.regs[0]).
+        // KVM exposes these only as KVM_REG_ARM_CORE registers:
+        // KVM_REG_ARM_CORE_REG(regs.sp), (sp_el1), (elr_el1) and
+        // (spsr[KVM_SPSR_EL1]) from the Linux uapi headers.
+        for (reg, core, sysreg) in [
+            (SysReg::SP_EL0, 0x6030_0000_0010_003e, 0x6030_0000_0013_c208),
+            (SysReg::SP_EL1, 0x6030_0000_0010_0044, 0x6030_0000_0013_e208),
+            (
+                SysReg::ELR_EL1,
+                0x6030_0000_0010_0046,
+                0x6030_0000_0013_c201,
+            ),
+            (
+                SysReg::SPSR_EL1,
+                0x6030_0000_0010_0048,
+                0x6030_0000_0013_c200,
+            ),
+        ] {
+            assert_eq!(reg.to_kvm_one_reg_id(), core, "{reg:?}");
+            assert_eq!(SysReg::from_kvm_one_reg_id(core), Some(reg));
+            // KVM rejects these system register ids with ENOENT.
+            assert_eq!(SysReg::from_kvm_one_reg_id(sysreg), None, "{reg:?}");
+        }
+
+        // Other KVM_REG_ARM_CORE registers (regs.regs[0], regs.pc).
         assert_eq!(SysReg::from_kvm_one_reg_id(0x6030_0000_0010_0000), None);
+        assert_eq!(SysReg::from_kvm_one_reg_id(0x6030_0000_0010_0040), None);
         // 32-bit sized system register id.
         assert_eq!(SysReg::from_kvm_one_reg_id(0x6020_0000_0013_c005), None);
         // Not an arm64 id (KVM_REG_X86).
