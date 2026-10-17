@@ -200,6 +200,11 @@ pub enum Error {
     InvalidRegister(u32),
     /// A `*_create()` function returned a null object.
     NullObject(&'static str),
+    /// A guest memory region has no host address, so it cannot be mapped.
+    NoHostAddress {
+        /// Guest physical address of the region.
+        ipa: u64,
+    },
 }
 
 impl Error {
@@ -240,6 +245,9 @@ impl fmt::Display for Error {
             Error::GicExists => write!(f, "the VM already has a GIC"),
             Error::InvalidRegister(reg) => write!(f, "invalid register {reg}"),
             Error::NullObject(call) => write!(f, "{call} returned a null object"),
+            Error::NoHostAddress { ipa } => {
+                write!(f, "guest memory region at {ipa:#x} has no host address")
+            }
         }
     }
 }
@@ -263,7 +271,8 @@ impl From<Error> for io::Error {
             | Error::OutOfRange { .. }
             | Error::Overlap { .. }
             | Error::GicAfterVcpu
-            | Error::InvalidRegister(_) => io::ErrorKind::InvalidInput,
+            | Error::InvalidRegister(_)
+            | Error::NoHostAddress { .. } => io::ErrorKind::InvalidInput,
             Error::NullObject(_) => io::ErrorKind::OutOfMemory,
         };
         io::Error::new(kind, e)
@@ -453,6 +462,10 @@ mod tests {
                 Error::NullObject("hv_vm_config_create"),
                 "hv_vm_config_create returned a null object",
             ),
+            (
+                Error::NoHostAddress { ipa: 0x4000_0000 },
+                "guest memory region at 0x40000000 has no host address",
+            ),
         ];
         for (e, s) in cases {
             assert_eq!(e.to_string(), s);
@@ -571,6 +584,10 @@ mod tests {
             (
                 Error::NullObject("hv_gic_config_create"),
                 io::ErrorKind::OutOfMemory,
+            ),
+            (
+                Error::NoHostAddress { ipa: 0x4000_0000 },
+                io::ErrorKind::InvalidInput,
             ),
         ];
         for (e, kind) in cases {

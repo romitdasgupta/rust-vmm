@@ -281,6 +281,6 @@ fn test_map_guest_memory_validates_first() {
     }]);
     // SAFETY: nothing is mapped.
     let e = unsafe { vm.map_guest_memory(&mem, MemoryFlags::RWX) }.unwrap_err();
-    assert!(matches!(e, Error::NullObject(_)), "{e:?}");
+    assert_eq!(e, Error::NoHostAddress { ipa: CODE_IPA });
     assert!(ipa_range_is_free(&vm, CODE_IPA, size));
 }
