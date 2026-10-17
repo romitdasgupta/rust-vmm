@@ -15,26 +15,36 @@
 #
 # Test binaries are signed with the com.apple.security.hypervisor entitlement
 # by the cargo runner in .cargo/config.toml (hvf/scripts/codesign-run.sh).
-# HVF_REQUIRE=1 turns every "SKIP" of a Hypervisor.framework test into a
-# failure, so a misconfigured agent cannot pass silently.
+# HVF_REQUIRE=1 turns the "SKIP" of a test into a failure when the
+# hypervisor is not usable (no kern.hv_support, unsigned binary), so a
+# misconfigured agent cannot pass silently. Tests of optional host features
+# still skip: EL2 needs an M3 or newer, the 4 KiB stage-2 granule macOS 26.0.
+# The GIC tests skip before macOS 15.0, so "hvf: host info" fails the build
+# on older hosts.
 #
 # Upload with:
 #   buildkite-agent pipeline upload .buildkite/pipeline.macos.yml
 #
 # Until such agents exist, maintainers run these commands locally on an Apple
-# silicon Mac before every hvf-bindings or hvf release.
+# silicon Mac before every hvf-bindings or hvf release. Clippy and the SDK
+# check need no hypervisor, so they run on GitHub's hosted macOS runners
+# (.github/workflows/macos.yml) rather than here.
 
 agents:
   queue: "macos-arm64"
 
 env:
   HVF_REQUIRE: "1"
+  # The unittests steps run tests/sdk_check.rs; fail it if xcrun is missing.
+  HVF_SDK_CHECK: "1"
   CARGO_TERM_COLOR: "always"
 
 steps:
   - label: "hvf: host info"
     command:
       - "sw_vers"
+      # `$$` escapes `$` from Buildkite's interpolation at upload time.
+      - "test \"$$(sw_vers -productVersion | cut -d. -f1)\" -ge 15 || { echo 'macOS 15.0 or newer is required' >&2; exit 1; }"
       - "sysctl -n machdep.cpu.brand_string kern.hv_support"
       - "xcrun --show-sdk-version"
       - "rustc --version"
@@ -48,18 +58,8 @@ steps:
     command: "cargo test -p hvf-bindings -p hvf --all-features --release"
     timeout_in_minutes: 30
 
-  - label: "hvf: sdk-check"
-    command: "cargo test -p hvf-bindings --test sdk_check"
-    env:
-      HVF_SDK_CHECK: "1"
-    timeout_in_minutes: 15
-
   - label: "hvf: example-mmio_guest"
     command: "cargo run -p hvf --example mmio_guest"
-    timeout_in_minutes: 15
-
-  - label: "hvf: clippy"
-    command: "cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks"
     timeout_in_minutes: 15
 
   # Informational only: the coverage scores enforced by CI are the Linux ones

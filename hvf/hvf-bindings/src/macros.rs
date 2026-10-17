@@ -57,18 +57,14 @@ macro_rules! __hv_since {
 /// it is newer than macOS 11.0.
 #[doc(hidden)]
 macro_rules! __hv_const {
-    ([] $(#[$m:meta])* $name:ident: $ty:ident = $val:expr) => {
+    ([$($maj:literal, $min:literal)?] $(#[$m:meta])* $name:ident: $ty:ident = $val:expr) => {
         $(#[$m])*
         #[doc = ""]
         #[doc = concat!("SDK constant `", stringify!($name), "` of type [`", stringify!($ty), "`].")]
-        pub const $name: $ty = $val;
-    };
-    ([$maj:literal, $min:literal] $(#[$m:meta])* $name:ident: $ty:ident = $val:expr) => {
-        $(#[$m])*
-        #[doc = ""]
-        #[doc = concat!("SDK constant `", stringify!($name), "` of type [`", stringify!($ty), "`].")]
-        #[doc = ""]
-        #[doc = concat!("Available since macOS ", stringify!($maj), ".", stringify!($min), ".")]
+        $(
+            #[doc = ""]
+            #[doc = concat!("Available since macOS ", stringify!($maj), ".", stringify!($min), ".")]
+        )?
         pub const $name: $ty = $val;
     };
 }
@@ -108,34 +104,16 @@ macro_rules! __hv_const {
 /// `(name, C type name, value, since)`. The C type name is the alias name,
 /// which is identical to the SDK typedef.
 macro_rules! hv_consts {
-    // Group declaring a new alias.
+    // Group declaring a new alias: emit it, then handle the constants as a
+    // `consts` group.
     (@munch [$($acc:tt)*]
         $(#[$tm:meta])*
-        pub type $tname:ident = $tty:ty {
-            $(
-                $(#[$cm:meta])*
-                $(@since($cmaj:literal, $cmin:literal))?
-                $cname:ident = $cval:expr
-            ),* $(,)?
-        }
+        pub type $tname:ident = $tty:ty { $($body:tt)* }
         $($rest:tt)*
     ) => {
         $(#[$tm])*
         pub type $tname = $tty;
-        $(
-            __hv_const!([$($cmaj, $cmin)?] $(#[$cm])* $cname: $tname = $cval);
-        )*
-        hv_consts!(@munch [
-            $($acc)*
-            $(
-                (
-                    stringify!($cname),
-                    stringify!($tname),
-                    $cname as i128,
-                    __hv_since!($($cmaj, $cmin)?),
-                ),
-            )*
-        ] $($rest)*);
+        hv_consts!(@munch [$($acc)*] consts $tname { $($body)* } $($rest)*);
     };
     // Group adding constants to an alias declared elsewhere.
     (@munch [$($acc:tt)*]

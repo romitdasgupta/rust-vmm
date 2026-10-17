@@ -59,4 +59,38 @@ if ! codesign -d --entitlements - "$bin" 2>/dev/null |
     trap - EXIT
 fi
 
+# /bin/sh is protected by System Integrity Protection, so dyld removes every
+# DYLD_* variable before this script starts. Cargo runs binaries with
+# DYLD_FALLBACK_LIBRARY_PATH pointing at the target directory and the
+# toolchain's libraries, which binaries linked against dylibs (for example
+# with -C prefer-dynamic) need to start. Rebuild the value Cargo sets.
+# Variables set by the user, such as DYLD_LIBRARY_PATH, cannot be recovered.
+if [ -z "${DYLD_FALLBACK_LIBRARY_PATH:-}" ]; then
+    dir=$(cd "$(dirname "$bin")" && pwd)
+    case "$dir" in
+        */deps | */examples) profile=$(dirname "$dir") ;;
+        *) profile=$dir ;;
+    esac
+    sysroot=$("${RUSTC:-rustc}" --print sysroot 2>/dev/null || true)
+    DYLD_FALLBACK_LIBRARY_PATH="$profile:$profile/deps"
+    if [ -n "$sysroot" ]; then
+        DYLD_FALLBACK_LIBRARY_PATH="$DYLD_FALLBACK_LIBRARY_PATH:$sysroot/lib/rustlib/aarch64-apple-darwin/lib:$sysroot/lib"
+    fi
+    DYLD_FALLBACK_LIBRARY_PATH="$DYLD_FALLBACK_LIBRARY_PATH:$HOME/lib:/usr/local/lib:/usr/lib"
+    export DYLD_FALLBACK_LIBRARY_PATH
+fi
+
+# With a runner, rustdoc does not tell an edition 2024 merged doctest binary
+# where it lives, so the binary runs all of its doctests in one process
+# ("WARNING: No rustdoc doctest environment variable provided"). hvf allows
+# one VM per process, so two VM-creating doctests would then fail with
+# VmExists. Set the variable rustdoc sets when it runs the binary itself, so
+# that every doctest gets its own process again. Standalone doctests ignore it.
+case "$bin" in
+    */rustdoctest*/*)
+        RUSTDOC_DOCTEST_BIN_PATH=$bin
+        export RUSTDOC_DOCTEST_BIN_PATH
+        ;;
+esac
+
 exec "$bin" "$@"

@@ -25,6 +25,8 @@ env:
   # Keep in sync with the toolchain of the rustvmm/dev container used by the
   # Linux Buildkite CI (`RUST_TOOLCHAIN` in rust-vmm-container's docker.env).
   RUST_TOOLCHAIN: "1.96.0"
+  # The SDK check test fails instead of skipping when xcrun is missing.
+  HVF_SDK_CHECK: "1"
 
 jobs:
   macos:
@@ -36,7 +38,7 @@ jobs:
 
     - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
       run: |
-        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --target x86_64-apple-darwin
         rustup default "$RUST_TOOLCHAIN"
         rustc --version
         xcrun --show-sdk-version
@@ -44,30 +46,28 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check --config format_code_in_doc_comments=true
 
-    - name: Check the workspace
-      run: cargo check --workspace --all-targets
-      env:
-        RUSTFLAGS: "-D warnings"
-
+    # Clippy also reports every rustc warning, so no separate `cargo check`
+    # is needed (and a different RUSTFLAGS would rebuild every dependency).
     - name: Clippy
       run: cargo clippy --workspace --all-targets -- -D warnings -D clippy::undocumented_unsafe_blocks
 
     - name: Clippy (hvf crates, all features)
       run: cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks
 
+    # Intel Macs get the types and constants of hvf-bindings, so make sure
+    # the hvf crates also build without warnings there.
+    - name: Clippy (hvf crates, x86_64-apple-darwin)
+      run: cargo clippy -p hvf-bindings -p hvf --all-targets --all-features --target x86_64-apple-darwin -- -D warnings -D clippy::undocumented_unsafe_blocks
+
+    # The hvf crates are tested with all features below.
     - name: Test the workspace
-      run: cargo test --workspace
+      run: cargo test --workspace --exclude hvf-bindings --exclude hvf
 
     - name: Test vm-memory with the mmap backends
       run: cargo test -p vm-memory --features backend-mmap,backend-bitmap,backend-atomic,iommu
 
     - name: Test the hvf crates with all features
       run: cargo test -p hvf-bindings -p hvf --all-features
-
-    - name: Check the bindings against the SDK headers
-      run: cargo test -p hvf-bindings --test sdk_check
-      env:
-        HVF_SDK_CHECK: "1"
 
     - name: Build the hvf documentation
       run: cargo doc -p hvf -p hvf-bindings --all-features --no-deps
