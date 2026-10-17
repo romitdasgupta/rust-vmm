@@ -11,9 +11,12 @@
 //! - Every `Vm`, [`Vcpu`] and [`Gic`](crate::Gic) handle holds an
 //!   `Arc<VmInner>`. Dropping the last one destroys the VM and frees the
 //!   slot.
-//! - If `hv_vm_destroy` keeps failing (for example because a forgotten vCPU
-//!   of an exited thread is still being torn down by the framework), the slot
-//!   becomes `Zombie` and the next `create_vm` retries the destroy.
+//! - If `hv_vm_destroy` keeps failing (because a vCPU created through
+//!   `hvf-bindings`, behind the crate's back, still exists on a live
+//!   thread), the slot becomes `Zombie` and the next `create_vm` retries
+//!   the destroy. A leaked [`Vcpu`] cannot cause this: it keeps its
+//!   `Arc<VmInner>`, so the slot stays `Live` and `create_vm` fails with
+//!   `VmExists` for the rest of the process.
 
 use std::mem;
 use std::ptr;
@@ -196,9 +199,10 @@ impl VmInner {
 
 impl Drop for VmInner {
     fn drop(&mut self) {
-        // Every `Vm`, `Vcpu` and `Gic` handle is gone, and every vCPU was
-        // destroyed by its handle (or leaked, in which case the framework
-        // destroys it when its thread exits).
+        // Every `Vm`, `Vcpu` and `Gic` handle is gone, so every vCPU created
+        // through this crate was destroyed by its handle (a leaked `Vcpu`
+        // keeps this `VmInner` alive). Only vCPUs created through
+        // `hvf-bindings` directly can still make the destroy fail.
         *slot_state() = if destroy_vm().is_ok() {
             SlotState::Free
         } else {
@@ -533,8 +537,8 @@ mod tests {
         let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
 
         // A vCPU created behind the crate's back keeps `hv_vm_destroy`
-        // failing with `HV_BUSY` while its thread lives. When the thread
-        // exits, the framework destroys it asynchronously.
+        // failing with `HV_BUSY` while its thread lives. `hv_vm_destroy`
+        // succeeds once that thread has exited.
         let (created_tx, created_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = thread::spawn(move || {

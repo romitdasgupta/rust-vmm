@@ -219,9 +219,9 @@ impl Hvf {
     /// ([`Error::is_unavailable`](crate::Error::is_unavailable)).
     ///
     /// If the previous VM could not be destroyed when its last handle was
-    /// dropped (for example because a vCPU leaked on an exiting thread was
-    /// still being torn down), the destroy is retried first and its error is
-    /// returned if it still fails.
+    /// dropped (because a vCPU created through `hvf-bindings` directly still
+    /// existed), the destroy is retried first and its error is returned if it
+    /// still fails.
     ///
     /// # Example
     ///
