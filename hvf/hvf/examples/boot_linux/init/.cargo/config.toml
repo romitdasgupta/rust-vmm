@@ -1,0 +1,13 @@
+# Cargo reads this file only when it runs from this directory (or below).
+# mkinitramfs.sh --init rust does that.
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+# A static Linux executable: no relocations, entry point `_start`, and
+# segments aligned for 64 KiB pages so any arm64 page size can map them.
+rustflags = [
+  "-C", "relocation-model=static",
+  "-C", "link-arg=--entry=_start",
+  "-C", "link-arg=-zmax-page-size=0x10000",
+]

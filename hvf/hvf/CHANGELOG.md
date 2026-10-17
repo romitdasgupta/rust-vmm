@@ -27,3 +27,12 @@
   in-kernel GICv3. It uses a PL011 console, PSCI SMP and power off, and
   `vm-memory`, `linux-loader`, `vm-device` and `vm-fdt`. An ignored test
   boots a kernel named by `HVF_LINUX_KERNEL` and `HVF_LINUX_INITRD`.
+- A step-by-step guide to booting Linux with `boot_linux`
+  (`examples/boot_linux/README.md`), with two POSIX shell scripts that need
+  neither root nor Python. `fetch-kernel.sh` downloads a SHA-256 pinned
+  Debian `cloud-arm64` kernel. `mkinitramfs.sh` builds an initramfs with
+  Alpine's static busybox and an interactive shell, or with
+  `--init rust`, with a minimal `no_std` Rust `/init`
+  (`examples/boot_linux/init`, outside the workspace). It writes the cpio
+  archive with `bsdtar` from an mtree manifest, so `/dev/console` needs no
+  `mknod`.

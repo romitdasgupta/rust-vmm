@@ -1,0 +1,23 @@
+[package]
+name = "hvf-boot-init"
+version = "0.1.0"
+authors = ["The rust-vmm authors"]
+description = "A minimal no_std /init for the boot_linux example of the hvf crate"
+license = "Apache-2.0 OR BSD-3-Clause"
+edition = "2024"
+publish = false
+
+# A workspace of its own: this crate is built for aarch64-unknown-none
+# (see .cargo/config.toml) and must stay out of the rust-vmm workspace, its
+# `cargo test --workspace` and its CI.
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

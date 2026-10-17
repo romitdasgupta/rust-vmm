@@ -58,11 +58,16 @@ cargo run -p hvf --example mmio_guest
 ## Booting Linux
 
 [`examples/boot_linux`](examples/boot_linux) is a small VMM that boots an
-arm64 Linux kernel to userspace (macOS 15.0 or newer):
+arm64 Linux kernel to userspace (macOS 15.0 or newer). Its
+[guide](examples/boot_linux/README.md) goes step by step from `git clone`
+to a busybox shell. Two scripts download a pinned Debian kernel and build
+an initramfs, without root:
 
 ```sh
+hvf/hvf/examples/boot_linux/scripts/fetch-kernel.sh
+hvf/hvf/examples/boot_linux/scripts/mkinitramfs.sh
 cargo run --release -p hvf --features vm-memory --example boot_linux -- \
-    --kernel Image --initrd initramfs.cpio.gz --cpus 4 --mem 512M
+    --kernel target/boot-linux/Image --initrd target/boot-linux/initramfs.cpio.gz
 ```
 
 The VMM puts these pieces together:
@@ -87,19 +92,27 @@ The VMM puts these pieces together:
   earlycon=pl011,mmio32,0x9000000 panic=-1`.
 - **Exit status.** The VMM exits with 0 when the guest powers off, 3 when
   it resets (for example after a panic with `panic=-1`), 130 after
-  `Ctrl-A x` and 1 on errors. `--verbose` logs the memory layout, the PSCI
-  calls and the vCPU power state changes.
+  `Ctrl-A x`, 1 on errors and 2 on unparseable arguments. `--verbose` logs
+  the memory layout, the PSCI calls and the vCPU power state changes.
 
-No kernel or initramfs is included in this repository. An initramfs whose
-`/init` prints `HVF-BOOT-OK` and then powers off, for example with
+No kernel or initramfs is included in this repository; the scripts write
+them to `target/boot-linux/`. An initramfs whose `/init` prints
+`HVF-BOOT-OK` and then powers off, for example with
 `reboot(LINUX_REBOOT_CMD_POWER_OFF)` or `poweroff -f`, can be checked with the
 ignored test in [`tests/boot_linux.rs`](tests/boot_linux.rs). The test boots
-with 1 and 4 vCPUs. Without the variables it prints `SKIP` and passes:
+with 1 and 4 vCPUs. It runs in `hvf/hvf`, so give absolute paths. Without the
+variables it prints `SKIP` and passes. With the busybox initramfs, whose
+`/init` powers off only when asked to:
 
 ```sh
-HVF_LINUX_KERNEL=Image HVF_LINUX_INITRD=initramfs.cpio.gz \
-    cargo test -p hvf --features vm-memory --test boot_linux -- --ignored
+HVF_LINUX_KERNEL=$PWD/target/boot-linux/Image \
+HVF_LINUX_INITRD=$PWD/target/boot-linux/initramfs.cpio.gz \
+HVF_LINUX_CMDLINE="console=ttyAMA0 panic=-1 hvf.autopoweroff" \
+    cargo test --release -p hvf --features vm-memory --test boot_linux -- --ignored
 ```
+
+The guide's [boot test section](examples/boot_linux/README.md#running-the-boot-test)
+has the same command for the Rust `/init` and the expected output.
 
 ## Supported platforms
 
