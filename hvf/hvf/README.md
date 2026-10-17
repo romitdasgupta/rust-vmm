@@ -156,7 +156,7 @@ automatically. `.cargo/config.toml` sets
 `aarch64-apple-darwin`. Doctests are signed too with Rust 1.89 or newer: older
 Cargo does not pass the runner to rustdoc, so with Rust 1.88 doctests run
 unsigned and the ones that create a VM take their "hypervisor unavailable"
-path.
+path (or fail under `HVF_REQUIRE=1`).
 
 The host probes (`Hvf::max_vcpu_count`, `max_ipa_bits`, `default_ipa_bits`,
 `el2_supported`, `default_ipa_granule`, `sme_max_svl_bytes`, `gic_params`,
@@ -395,8 +395,8 @@ called (alignment, IPA range, overlap, MSI range inside the SPI range).
 Tests that create a VM need a host where `kern.hv_support` is 1, and a signed
 binary. In this repository the runner takes care of signing. On hosts without
 HVF, such as Linux, GitHub-hosted macOS runners or unsigned binaries, these
-tests print `SKIP` and pass. Set `HVF_REQUIRE=1` to make the unit and
-integration tests fail instead when the hypervisor is not usable (no
+tests print `SKIP` and pass. Set `HVF_REQUIRE=1` to make the unit,
+integration and doc tests fail instead when the hypervisor is not usable (no
 `kern.hv_support`, unsigned binary):
 
 ```sh

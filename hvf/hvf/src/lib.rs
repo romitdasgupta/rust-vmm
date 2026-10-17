@@ -66,8 +66,13 @@
 //! // 1. Create the VM.
 //! let vm = match Hvf::create_vm(&VmConfig::default()) {
 //!     Ok(vm) => vm,
-//! #   // Not signed, not supported, or running in a VM without nested virtualization.
-//! #   Err(hvf::Error::Hv { err, .. }) if err.is_unavailable() => return Ok(()),
+//! #   // Not signed, not supported, or running in a VM without nested
+//! #   // virtualization. HVF_REQUIRE=1 makes this a failure, as in the tests.
+//! #   Err(hvf::Error::Hv { err, .. })
+//! #       if err.is_unavailable() && std::env::var_os("HVF_REQUIRE").is_none_or(|v| v != "1") =>
+//! #   {
+//! #       return Ok(())
+//! #   }
 //!     Err(e) => return Err(e.into()),
 //! };
 //!
