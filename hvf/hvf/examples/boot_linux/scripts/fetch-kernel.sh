@@ -94,10 +94,17 @@ trap 'rm -rf "$work"' EXIT
 mkdir "$work/dl" "$work/deb" "$work/data"
 
 deb=$work/dl/$DEB
+# Show curl's progress bar only when stderr is a terminal. In a log it is
+# noise, so print only errors there.
+if [ -t 2 ]; then
+    progress=--progress-bar
+else
+    progress=-sS
+fi
 got=
 for url in $DEB_URLS; do
     echo "Downloading $url"
-    if curl -fL --proto '=https' --tlsv1.2 --retry 3 --progress-bar \
+    if curl -fL --proto '=https' --tlsv1.2 --retry 3 "$progress" \
         -o "$deb" "$url"; then
         got=$url
         break

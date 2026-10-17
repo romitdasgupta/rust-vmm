@@ -67,8 +67,7 @@ an initramfs, without root:
 hvf/hvf/examples/boot_linux/scripts/fetch-kernel.sh
 hvf/hvf/examples/boot_linux/scripts/mkinitramfs.sh
 cargo run --release -p hvf --features vm-memory --example boot_linux -- \
-    --kernel target/boot-linux/Image --initrd target/boot-linux/initramfs.cpio.gz \
-    --cpus 4 --mem 512M
+    --kernel target/boot-linux/Image --initrd target/boot-linux/initramfs.cpio.gz
 ```
 
 The VMM puts these pieces together:
@@ -93,8 +92,8 @@ The VMM puts these pieces together:
   earlycon=pl011,mmio32,0x9000000 panic=-1`.
 - **Exit status.** The VMM exits with 0 when the guest powers off, 3 when
   it resets (for example after a panic with `panic=-1`), 130 after
-  `Ctrl-A x` and 1 on errors. `--verbose` logs the memory layout, the PSCI
-  calls and the vCPU power state changes.
+  `Ctrl-A x`, 1 on errors and 2 on unparseable arguments. `--verbose` logs
+  the memory layout, the PSCI calls and the vCPU power state changes.
 
 No kernel or initramfs is included in this repository; the scripts write
 them to `target/boot-linux/`. An initramfs whose `/init` prints
@@ -109,8 +108,11 @@ variables it prints `SKIP` and passes. With the busybox initramfs, whose
 HVF_LINUX_KERNEL=$PWD/target/boot-linux/Image \
 HVF_LINUX_INITRD=$PWD/target/boot-linux/initramfs.cpio.gz \
 HVF_LINUX_CMDLINE="console=ttyAMA0 panic=-1 hvf.autopoweroff" \
-    cargo test -p hvf --features vm-memory --test boot_linux -- --ignored
+    cargo test --release -p hvf --features vm-memory --test boot_linux -- --ignored
 ```
+
+The guide's [boot test section](examples/boot_linux/README.md#running-the-boot-test)
+has the same command for the Rust `/init` and the expected output.
 
 ## Supported platforms
 

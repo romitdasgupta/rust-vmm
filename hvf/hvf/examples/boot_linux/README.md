@@ -78,8 +78,18 @@ codesign --sign - --force --entitlements hvf/scripts/hvf.entitlements \
     target/release/examples/boot_linux
 ```
 
-`codesign -d --entitlements - target/release/examples/boot_linux` shows
-whether a binary has the entitlement.
+To check whether a binary has the entitlement:
+
+```console
+$ codesign -d --entitlements - target/release/examples/boot_linux
+Executable=.../target/release/examples/boot_linux
+[Dict]
+    [Key] com.apple.security.hypervisor
+    [Value]
+        [Bool] true
+```
+
+An unsigned or freshly rebuilt binary prints only the `Executable=` line.
 
 ## Step 1: clone and build
 
@@ -131,8 +141,9 @@ script:
 Pass a directory to write somewhere else: `fetch-kernel.sh /path/to/dir`.
 A second run does nothing if the `Image` is already there and matches.
 
-Expected output (the `###` progress bar appears only when the output is a
-terminal):
+Expected output. The `###` progress bar appears only when stderr is a
+terminal; with stderr redirected to a file or a pipe, the script prints only
+the three lines and any errors:
 
 ```text
 Downloading https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.12.111+deb13-cloud-arm64-unsigned_6.12.111-1_arm64.deb
@@ -248,6 +259,9 @@ exits with status 0. `Ctrl-A x` stops the VMM at any time with status 130:
 ~ # boot_linux: stopped by Ctrl-A x
 ```
 
+A log captured through a pty shows `^[[6n` between the prompt and the
+message (`~ # ^[[6nboot_linux: stopped by Ctrl-A x`); see below.
+
 To drive the shell from a script (`expect`, `script`, CI), read
 [the troubleshooting entry about `^[[6n`](#troubleshooting) first: the
 prompt asks the terminal a question that a script should answer.
@@ -306,6 +320,9 @@ Expected output, abridged:
 Building the Rust /init in .../hvf/hvf/examples/boot_linux/init
     Finished `release` profile [optimized] target(s) in ...
 Wrote .../target/boot-linux/initramfs-rust.cpio.gz (rust /init, ... bytes)
+     Running `.../hvf/scripts/codesign-run.sh target/release/examples/boot_linux --kernel target/boot-linux/Image --initrd target/boot-linux/initramfs-rust.cpio.gz`
+...
+[    0.004549] smp: Brought up 1 node, 1 CPU
 ...
 [    0.085377] Run /init as init process
 HVF-BOOT-OK: hello from the Rust /init
@@ -314,6 +331,12 @@ Powering off.
 [    0.086060] reboot: Power down
 boot_linux: the guest powered off
 ```
+
+`--cpus N` works the same way: add `--cpus 4` to the `cargo run` line and
+the log shows `smp: Brought up 1 node, 4 CPUs` and
+`SMP: Total of 4 processors activated.` before the greeting, as in
+[Step 5](#step-5-boot-without-a-shell-on-more-vcpus). The Rust `/init`
+powers off by itself, so it needs no `hvf.autopoweroff`.
 
 `init/` is a standalone crate with its own `[workspace]` table, so it is not
 part of the rust-vmm workspace and `cargo test --workspace` does not build
@@ -420,8 +443,8 @@ the device tree in the last 2 MiB.
 | Status | Meaning | Message on stderr |
 |---|---|---|
 | 0 | The guest powered off (PSCI `SYSTEM_OFF`) | `boot_linux: the guest powered off` |
-| 1 | An error, for example a missing file or `HV_DENIED` | `boot_linux: <error>` |
-| 2 | Bad command line arguments | `boot_linux: <error>` and the usage |
+| 1 | An error, for example a missing file, `HV_DENIED`, or a `--cpus` or `--mem` value that parses but is out of range (`--cpus 0`, `--cpus 999`, `--mem 3`) | `boot_linux: <error>` |
+| 2 | An unknown flag, a flag without its value, a value that is not a number (`--cpus abc`), or a missing `--kernel` | `boot_linux: <error>` and the usage |
 | 3 | The guest reset (PSCI `SYSTEM_RESET`), for example after a panic with `panic=-1` | `boot_linux: the guest requested a reset` |
 | 130 | `Ctrl-A x` | `boot_linux: stopped by Ctrl-A x` |
 
@@ -692,7 +715,21 @@ expect eof
 The commands then run at once. Answer with a row other than 1: busybox
 can take `ESC[1;5R` for a function key (`Ctrl-F3`) and lose the input that
 follows. Setting `TERM=dumb` does not help; this busybox sends the query
-anyway. If the run needs no shell, boot with `hvf.autopoweroff` (see
+anyway. With `script`, feed the keys through a pipe and give the guest time
+to reach each prompt; the `^[[6n` bytes stay in the log but do no harm:
+
+```sh
+(sleep 3; printf 'uname -a\r'; sleep 1; printf 'exit\r') |
+    script -q /dev/null cargo run --release -p hvf --features vm-memory --example boot_linux -- \
+        --kernel target/boot-linux/Image --initrd target/boot-linux/initramfs.cpio.gz
+```
+
+The `sleep`s assume the VMM is already built (Step 1). macOS `script`
+rejects a named pipe as its stdin: `script ... < fifo` stops at once with
+`script: tcgetattr/ioctl: Operation not supported on socket` and status 1.
+Use an anonymous pipe as above, or `expect`.
+
+If the run needs no shell, boot with `hvf.autopoweroff` (see
 [Step 5](#step-5-boot-without-a-shell-on-more-vcpus)) or use the Rust
 `/init` instead.
 
