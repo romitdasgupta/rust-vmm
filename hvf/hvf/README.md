@@ -182,13 +182,13 @@ keeps it alive, and the VM is destroyed when the last handle is dropped. A
 the process. That is a leak, not undefined behaviour.
 
 `hv_vm_destroy` fails while a vCPU still exists. This can happen when vCPUs
-were created through `hvf-bindings` directly and still exist. A leaked
-`Vcpu` cannot cause it: it keeps the VM alive, so `create_vm` fails with
-`Error::VmExists` instead. The crate then records the VM as a *zombie*. The
-next `create_vm` retries the destroy, fails with
-`Error::Hv { call: "hv_vm_destroy", .. }` (`HV_BUSY`) while the vCPU still
-exists, and succeeds once the framework has released it. On macOS 27 that
-takes a few milliseconds after the owning thread exits.
+were created through `hvf-bindings` directly and still exist. The crate then
+records the VM as a *zombie*. The next `create_vm` retries the destroy, fails
+with `Error::Hv { call: "hv_vm_destroy", .. }` (`HV_BUSY`) while the vCPU
+still exists, and succeeds once the framework has released it. On macOS 27
+that takes a few milliseconds after the owning thread exits. A leaked `Vcpu`
+cannot cause a zombie: it keeps the VM alive, so `create_vm` fails with
+`Error::VmExists` instead.
 
 ## Threading
 
