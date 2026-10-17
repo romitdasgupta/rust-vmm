@@ -8,8 +8,10 @@
 //! as for encryption but will probably be suitable when you want locally
 //! unique ID's that will not be shared over the network.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::str;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Gets an ever increasing u64 (at least for this process).
 ///
@@ -51,13 +53,48 @@ pub fn timestamp_cycles() -> u64 {
     }
 }
 
-/// Generate pseudo random u32 numbers based on the current timestamp.
+/// Generate pseudo random u32 numbers.
+///
+/// Each thread keeps its own xorshift state, seeded on first use from
+/// [`timestamp_cycles`] mixed with a process-wide counter, and advanced on
+/// every call. Consecutive calls on the same thread therefore never return
+/// the same value, even when the clock is coarser than the time between them.
 pub fn xor_pseudo_rng_u32() -> u32 {
-    let mut t: u32 = timestamp_cycles() as u32;
-    // Taken from https://en.wikipedia.org/wiki/Xorshift
-    t ^= t << 13;
-    t ^= t >> 17;
-    t ^ (t << 5)
+    thread_local! {
+        static STATE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    STATE.with(|state| {
+        let mut t = state.get();
+        if t == 0 {
+            t = seed();
+        }
+        // Taken from https://en.wikipedia.org/wiki/Xorshift
+        t ^= t << 13;
+        t ^= t >> 17;
+        t ^= t << 5;
+        state.set(t);
+        t
+    })
+}
+
+// Returns a non-zero xorshift seed. The process-wide counter makes threads
+// seeded within the same clock tick start from different states.
+fn seed() -> u32 {
+    static SEED_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let ts = timestamp_cycles();
+    // Use a Weyl increment so that consecutive counter values are far apart.
+    let count = SEED_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_mul(0x9e37_79b9);
+    let seed = (ts as u32) ^ ((ts >> 32) as u32) ^ count;
+    // xorshift has an all-zero fixed point, so never start from zero.
+    if seed == 0 {
+        0x9e37_79b9
+    } else {
+        seed
+    }
 }
 
 // This will get an array of numbers that can safely be converted to strings
@@ -136,23 +173,40 @@ mod tests {
         assert!((0..1_000_000).any(|_| timestamp_cycles() > start));
     }
 
-    // Spins until `timestamp_cycles()` returns a value different from `prev`.
-    fn wait_for_next_timestamp(prev: u64) {
-        while timestamp_cycles() == prev {
-            std::hint::spin_loop();
+    #[test]
+    fn test_xor_pseudo_rng_u32() {
+        for _ in 0..1000 {
+            assert_ne!(xor_pseudo_rng_u32(), xor_pseudo_rng_u32());
         }
     }
 
     #[test]
-    fn test_xor_pseudo_rng_u32() {
+    fn test_xor_pseudo_rng_u32_no_repeated_words() {
+        // The generator must not depend on the clock advancing between calls:
+        // no 4-byte word may repeat within a short burst of draws.
         for _ in 0..1000 {
-            let a = xor_pseudo_rng_u32();
-            // `xor_pseudo_rng_u32` is a pure function of the timestamp, so make
-            // sure the timestamp moved before drawing the second number.
-            wait_for_next_timestamp(timestamp_cycles());
-            let b = xor_pseudo_rng_u32();
-            assert_ne!(a, b);
+            let bytes = rand_bytes(16);
+            let words: Vec<&[u8]> = bytes.chunks(4).collect();
+            for i in 0..words.len() {
+                for j in i + 1..words.len() {
+                    assert_ne!(words[i], words[j], "repeated word in {bytes:x?}");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn test_xor_pseudo_rng_u32_threads_diverge() {
+        // Threads seeded within the same clock tick still get different
+        // sequences.
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| [xor_pseudo_rng_u32(), xor_pseudo_rng_u32()]))
+            .collect();
+        let mut seqs: Vec<[u32; 2]> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let n = seqs.len();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), n);
     }
 
     #[test]
