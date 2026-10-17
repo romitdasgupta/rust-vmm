@@ -9,14 +9,14 @@
 
 mod common;
 
-use std::sync::{Arc, Barrier, mpsc};
-use std::thread;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use common::{
     GUEST_IPA, GuestRam, SPIN, WFI, boot_vcpu, expect_exception, hv_guard, hvc, kick_after,
 };
-use hvf::{Error, ExceptionClass, Hvf, Reg, VcpuExit, VmConfig};
+use hvf::{Error, ExceptionClass, Hvf, Reg, Vcpu, VcpuExit, VcpuKicker, VmConfig};
 
 #[test]
 fn test_second_vcpu_on_same_thread() {
@@ -164,6 +164,71 @@ fn test_stale_kicker_and_id_reuse() {
     );
 }
 
+/// vCPUs started on their own threads by [`spawn_vcpu_threads`].
+struct VcpuThreads {
+    /// The kickers of the vCPUs, in no particular order.
+    kickers: Vec<VcpuKicker>,
+    /// Lets the threads run their vCPUs: one sender per thread.
+    start: Vec<mpsc::Sender<()>>,
+    /// The threads, which return the id of their vCPU and its exit.
+    handles: Vec<JoinHandle<(u64, VcpuExit)>>,
+}
+
+impl VcpuThreads {
+    /// Lets every thread run its vCPU.
+    fn start(&self) {
+        for tx in &self.start {
+            tx.send(()).unwrap();
+        }
+    }
+}
+
+/// Spawns `n` threads that each create a vCPU with `boot`, send back its
+/// kicker, wait for [`VcpuThreads::start`] and then run it.
+///
+/// Every vCPU exists once this returns. If a thread dies before sending its
+/// kicker, this returns the thread handles instead of waiting forever for the
+/// kicker, and the other threads give up: nothing blocks on a thread that is
+/// gone.
+fn spawn_vcpu_threads<F>(n: usize, boot: F) -> Result<VcpuThreads, Vec<JoinHandle<(u64, VcpuExit)>>>
+where
+    F: Fn(usize) -> Vcpu + Clone + Send + 'static,
+{
+    let (kicker_tx, kicker_rx) = mpsc::channel();
+    let mut start = Vec::new();
+    let handles: Vec<_> = (0..n)
+        .map(|i| {
+            let boot = boot.clone();
+            let kicker_tx = kicker_tx.clone();
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            start.push(start_tx);
+            thread::spawn(move || {
+                let mut vcpu = boot(i);
+                kicker_tx.send(vcpu.kicker()).unwrap();
+                drop(kicker_tx);
+                // Keep every vCPU alive until all were created. The sender
+                // is gone if the test thread gave up.
+                start_rx.recv().expect("the test thread gave up");
+                // Every vCPU runs its guest until kicked.
+                let exit = vcpu.run().unwrap();
+                (vcpu.id(), exit)
+            })
+        })
+        .collect();
+    // Only the threads hold senders now, so `recv` fails once every thread
+    // either sent its kicker or died.
+    drop(kicker_tx);
+    match (0..n).map(|_| kicker_rx.recv()).collect() {
+        Ok(kickers) => Ok(VcpuThreads {
+            kickers,
+            start,
+            handles,
+        }),
+        // Dropping `start` makes the surviving threads give up.
+        Err(mpsc::RecvError) => Err(handles),
+    }
+}
+
 #[test]
 fn test_vcpus_on_many_threads() {
     let Some(_g) = hv_guard() else { return };
@@ -173,33 +238,19 @@ fn test_vcpus_on_many_threads() {
 
     let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
     let _code = GuestRam::with_code(&vm, &[SPIN]);
-    let created = Arc::new(Barrier::new(N + 1));
-    let (kicker_tx, kicker_rx) = mpsc::channel();
-
-    let handles: Vec<_> = (0..N)
-        .map(|_| {
-            let vm = vm.clone();
-            let created = created.clone();
-            let kicker_tx = kicker_tx.clone();
-            thread::spawn(move || {
-                let mut vcpu = boot_vcpu(&vm, GUEST_IPA);
-                kicker_tx.send(vcpu.kicker()).unwrap();
-                // Keep every vCPU alive until all were created.
-                created.wait();
-                // Every vCPU runs its guest until kicked.
-                let exit = vcpu.run().unwrap();
-                (vcpu.id(), exit)
-            })
-        })
-        .collect();
-    let kickers: Vec<_> = (0..N).map(|_| kicker_rx.recv().unwrap()).collect();
-    created.wait();
+    let threads = {
+        let vm = vm.clone();
+        spawn_vcpu_threads(N, move |_| boot_vcpu(&vm, GUEST_IPA))
+    }
+    .unwrap_or_else(|_| panic!("a vCPU thread died before sending its kicker"));
+    threads.start();
     thread::sleep(Duration::from_millis(20));
-    for kicker in &kickers {
+    for kicker in &threads.kickers {
         assert!(kicker.kick().unwrap());
     }
 
-    let mut ids: Vec<u64> = handles
+    let mut ids: Vec<u64> = threads
+        .handles
         .into_iter()
         .map(|h| {
             let (id, exit) = h.join().unwrap();
@@ -211,7 +262,38 @@ fn test_vcpus_on_many_threads() {
     ids.dedup();
     assert_eq!(ids.len(), N, "vCPU ids are not distinct");
     // All vCPUs are destroyed with their threads.
-    for kicker in &kickers {
+    for kicker in &threads.kickers {
         assert!(!kicker.kick().unwrap());
+    }
+}
+
+/// Regression test for D2-6: a vCPU thread that dies before handing over
+/// its kicker fails the test instead of hanging it.
+#[test]
+fn test_vcpu_thread_dies_before_start() {
+    let Some(_g) = hv_guard() else { return };
+    const N: usize = 4;
+    let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
+    let _code = GuestRam::with_code(&vm, &[SPIN]);
+    let (tx, rx) = mpsc::channel();
+    {
+        let vm = vm.clone();
+        thread::spawn(move || {
+            let result = spawn_vcpu_threads(N, move |i| {
+                assert_ne!(i, 2, "injected failure of vCPU thread {i}");
+                boot_vcpu(&vm, GUEST_IPA)
+            });
+            let _ = tx.send(result.err());
+        });
+    }
+    let handles = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("spawn_vcpu_threads hangs when a vCPU thread dies")
+        .expect("spawn_vcpu_threads did not notice the dead vCPU thread");
+    // The failed thread and the ones that gave up all panicked, which
+    // destroyed their vCPUs.
+    assert_eq!(handles.len(), N);
+    for h in handles {
+        assert!(h.join().is_err());
     }
 }
