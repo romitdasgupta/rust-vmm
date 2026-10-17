@@ -94,11 +94,11 @@ An unsigned or freshly rebuilt binary prints only the `Executable=` line.
 ## Step 1: clone and build
 
 Until the `hvf` crates are merged upstream, `rust-vmm/rust-vmm` has no
-`hvf/` directory. Clone the repository and branch that contain it instead,
-and check that `hvf/hvf/examples/boot_linux` exists:
+`hvf/` directory. Clone the `hvf-support` branch of the fork that carries
+it instead, and check that `hvf/hvf/examples/boot_linux` exists:
 
 ```sh
-git clone -b <branch> <repository URL> rust-vmm
+git clone -b hvf-support https://github.com/romitdasgupta/rust-vmm.git rust-vmm
 cd rust-vmm
 ls hvf/hvf/examples/boot_linux
 cargo build --release -p hvf --features vm-memory --example boot_linux
