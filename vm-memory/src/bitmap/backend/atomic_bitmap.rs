@@ -190,27 +190,8 @@ impl Default for AtomicBitmap {
 
 impl NewBitmap for AtomicBitmap {
     fn with_len(len: usize) -> Self {
-        #[cfg(target_family = "unix")]
-        // SAFETY: There's no unsafe potential in calling this function.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
-
-        #[cfg(target_family = "windows")]
-        let page_size = {
-            use winapi::um::sysinfoapi::GetSystemInfo;
-            let mut sysinfo = std::mem::MaybeUninit::zeroed();
-            // SAFETY: It's safe to call `GetSystemInfo` as `sysinfo` is rightly sized
-            // allocated memory.
-            unsafe { GetSystemInfo(sysinfo.as_mut_ptr()) };
-            // SAFETY: It's safe to call `assume_init` as `GetSystemInfo` initializes `sysinfo`.
-            unsafe { sysinfo.assume_init().dwPageSize }
-        };
-
-        // The `unwrap` is safe to use because the above call should always succeed on the
-        // supported platforms, and the size of a page will always fit within a `usize`.
-        AtomicBitmap::new(
-            len,
-            NonZeroUsize::try_from(usize::try_from(page_size).unwrap()).unwrap(),
-        )
+        // The host page size is never zero on the supported platforms.
+        AtomicBitmap::new(len, NonZeroUsize::new(crate::page_size()).unwrap())
     }
 }
 

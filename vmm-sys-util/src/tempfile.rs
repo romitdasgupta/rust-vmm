@@ -32,9 +32,7 @@ use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use libc;
-
-use crate::errno::{errno_result, Error, Result};
+use crate::errno::{Error, Result};
 
 /// Wrapper for working with temporary files.
 ///
@@ -55,6 +53,7 @@ impl TempFile {
     /// the filename.
     #[cfg(unix)]
     pub fn new_with_prefix<P: AsRef<OsStr>>(prefix: P) -> Result<TempFile> {
+        use crate::errno::errno_result;
         use std::ffi::CString;
         use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
 

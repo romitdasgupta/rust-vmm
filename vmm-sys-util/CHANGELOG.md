@@ -14,9 +14,15 @@
 
 ### Fixed
 
-- `rand::timestamp_cycles` uses `CLOCK_UPTIME_RAW` on Apple targets, where
-  `CLOCK_MONOTONIC` only has microsecond resolution. Its documentation now
+- `rand::timestamp_cycles` uses `CLOCK_UPTIME_RAW` instead of `CLOCK_MONOTONIC`
+  on non-x86_64 Apple targets (Apple silicon), where `CLOCK_MONOTONIC` only has
+  microsecond resolution; x86_64 targets, including Intel Macs, still use
+  `rdtsc`. Its documentation now
   states that consecutive calls may return the same value.
+- `rand::xor_pseudo_rng_u32` (and thus `rand_bytes` and `rand_alphanumerics`)
+  keeps a per-thread xorshift state instead of hashing the current timestamp,
+  so consecutive calls no longer return the same value when the clock is
+  coarser than the time between calls (e.g. on Apple silicon).
 - Fixed `rand`, `tempdir` and `metric` unit tests on macOS (coarse clock
   resolution, symlinked temporary directories) and a Rust 1.99 clippy lint.
 

@@ -179,9 +179,7 @@ impl<B: Bitmap> MmapRegionBuilder<B> {
     }
 
     fn build_raw(self) -> Result<MmapRegion<B>> {
-        // SAFETY: Safe because this call just returns the page size and doesn't have any side
-        // effects.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let page_size = crate::page_size();
         let addr = self.raw_ptr.unwrap();
 
         // Check that the pointer to the mapping is page-aligned.
@@ -608,7 +606,7 @@ mod tests {
     #[cfg(not(miri))] // Causes warnings due to the pointer casts
     fn test_mmap_region_build_raw() {
         let addr = 0;
-        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let size = crate::page_size();
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_NORESERVE | libc::MAP_PRIVATE;
 
