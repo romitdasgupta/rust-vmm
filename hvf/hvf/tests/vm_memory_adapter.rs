@@ -10,8 +10,8 @@
 
 mod common;
 
-use common::hv_guard;
-use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Reg, VcpuExit, Vm, VmConfig};
+use common::{boot_vcpu, expect_exception, hv_guard};
+use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Vm, VmConfig};
 use vm_memory::{
     Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
     GuestMemoryRegionBytes, GuestRegionMmap, GuestUsize, MmapRegion,
@@ -114,18 +114,11 @@ fn test_map_guest_memory_runs_guest() {
     // only accessed through `Bytes`.
     unsafe { vm.map_guest_memory(&mem, MemoryFlags::RWX).unwrap() };
 
-    let mut vcpu = vm.create_vcpu(None).unwrap();
-    vcpu.set_reg(Reg::PC, CODE_IPA).unwrap();
-    vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
-    match vcpu.run().unwrap() {
-        VcpuExit::Exception(e) => {
-            assert!(
-                matches!(e.decode(), ExceptionClass::Hvc { imm: 0 }),
-                "{e:?}"
-            )
-        }
-        other => panic!("unexpected exit: {other:?}"),
-    }
+    let mut vcpu = boot_vcpu(&vm, CODE_IPA);
+    assert_eq!(
+        expect_exception(vcpu.run().unwrap()),
+        ExceptionClass::Hvc { imm: 0 }
+    );
     assert_eq!(mem.read_obj::<u32>(GuestAddress(DATA_IPA)).unwrap(), 0x42);
     drop(vcpu);
 
