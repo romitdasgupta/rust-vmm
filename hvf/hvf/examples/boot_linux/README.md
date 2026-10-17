@@ -83,14 +83,19 @@ whether a binary has the entitlement.
 
 ## Step 1: clone and build
 
+Until the `hvf` crates are merged upstream, `rust-vmm/rust-vmm` has no
+`hvf/` directory. Clone the repository and branch that contain it instead,
+and check that `hvf/hvf/examples/boot_linux` exists:
+
 ```sh
-git clone https://github.com/rust-vmm/rust-vmm.git
+git clone -b <branch> <repository URL> rust-vmm
 cd rust-vmm
+ls hvf/hvf/examples/boot_linux
 cargo build --release -p hvf --features vm-memory --example boot_linux
 ```
 
-Use the repository or branch that contains `hvf/`, if it is not yet merged
-upstream. The `rust-vmm-ci` submodule is not needed.
+Once merged, that is `git clone https://github.com/rust-vmm/rust-vmm.git`.
+The `rust-vmm-ci` submodule is not needed.
 
 Expected output ends with:
 
@@ -126,7 +131,8 @@ script:
 Pass a directory to write somewhere else: `fetch-kernel.sh /path/to/dir`.
 A second run does nothing if the `Image` is already there and matches.
 
-Expected output:
+Expected output (the `###` progress bar appears only when the output is a
+terminal):
 
 ```text
 Downloading https://deb.debian.org/debian/pool/main/l/linux/linux-image-6.12.111+deb13-cloud-arm64-unsigned_6.12.111-1_arm64.deb
@@ -156,8 +162,11 @@ Expected output:
 ```text
 Downloading https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/busybox-static-1.37.0-r31.apk
 Verified busybox-static-1.37.0-r31.apk (sha256 965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75)
-Wrote .../target/boot-linux/initramfs.cpio.gz (busybox /init, 659546 bytes)
+Wrote .../target/boot-linux/initramfs.cpio.gz (busybox /init, ... bytes)
 ```
+
+The archive is about 660 KB. Its exact size changes slightly from run to
+run, because the archive records the inode numbers of the staged files.
 
 ```console
 $ tar -tvf target/boot-linux/initramfs.cpio.gz
@@ -171,7 +180,7 @@ drwx------  0 0      0           0 Dec 31  1969 ./root
 drwxr-xr-x  0 0      0           0 Dec 31  1969 ./bin
 -rwxr-xr-x  1 0      0     1116408 Dec 31  1969 ./bin/busybox
 lrwxrwxrwx  0 0      0           7 Dec 31  1969 ./bin/sh -> busybox
--rwxr-xr-x  1 0      0         898 Dec 31  1969 ./init
+-rwxr-xr-x  1 0      0         939 Dec 31  1969 ./init
 ```
 
 The busybox binary is an aarch64 Linux executable. It is never run on the
@@ -239,6 +248,10 @@ exits with status 0. `Ctrl-A x` stops the VMM at any time with status 130:
 ~ # boot_linux: stopped by Ctrl-A x
 ```
 
+To drive the shell from a script (`expect`, `script`, CI), read
+[the troubleshooting entry about `^[[6n`](#troubleshooting) first: the
+prompt asks the terminal a question that a script should answer.
+
 ## Step 5: boot without a shell, on more vCPUs
 
 `hvf.autopoweroff` makes the busybox `/init` power off right after its
@@ -273,9 +286,11 @@ This mode needs no terminal: it also works with stdin redirected from
 ## Alternative: the minimal Rust /init
 
 `--init rust` builds the initramfs from a tiny `no_std` Rust program
-instead of busybox. Nothing is downloaded. The program in [`init/`](init)
-uses raw system calls, prints `HVF-BOOT-OK` and the `uname` fields, and
-powers off. The initramfs is about 2 KB.
+instead of busybox. It replaces Step 3 only: you still need the kernel from
+[Step 2](#step-2-download-the-kernel), but busybox is not downloaded. The
+program in [`init/`](init) uses raw system calls, prints `HVF-BOOT-OK` and
+the `uname` fields, and powers off. The initramfs is about 2 KB; its exact
+size varies by a few bytes between toolchains and runs.
 
 ```sh
 rustup target add aarch64-unknown-none
@@ -290,7 +305,7 @@ Expected output, abridged:
 ```text
 Building the Rust /init in .../hvf/hvf/examples/boot_linux/init
     Finished `release` profile [optimized] target(s) in ...
-Wrote .../target/boot-linux/initramfs-rust.cpio.gz (rust /init, 1945 bytes)
+Wrote .../target/boot-linux/initramfs-rust.cpio.gz (rust /init, ... bytes)
 ...
 [    0.085377] Run /init as init process
 HVF-BOOT-OK: hello from the Rust /init
@@ -305,13 +320,18 @@ part of the rust-vmm workspace and `cargo test --workspace` does not build
 it. Its `.cargo/config.toml` selects the `aarch64-unknown-none` target and
 the linker flags for a static executable; Cargo reads that file only when it
 runs inside `init/`. The script builds it into
-`target/boot-linux/init/`. To work on it directly:
+`target/boot-linux/init/` and packs the binary from there. To work on it
+directly:
 
 ```sh
 cd hvf/hvf/examples/boot_linux/init
 cargo build --release
 cargo clippy -- -D warnings -D clippy::undocumented_unsafe_blocks
 ```
+
+A build run this way goes to `init/target/` (ignored by git), not to
+`target/boot-linux/init/`, so `mkinitramfs.sh --init rust` does not pick it
+up; the script always builds its own copy.
 
 Use `-o` as above to keep both initramfs files; without it, both variants
 write `target/boot-linux/initramfs.cpio.gz`.
@@ -407,18 +427,33 @@ the device tree in the last 2 MiB.
 
 ### Verbose output
 
-`--verbose` prefixes the VMM's own messages with `[boot_linux]`:
+`--verbose` prefixes the VMM's own messages with `[boot_linux]` on stderr.
+The complete output of a boot with the Rust `/init` on 2 vCPUs
+(`--cpus 2 --verbose`, stdout left out):
 
 ```text
-[boot_linux] RAM 0x80000000..0xa0000000, kernel 0x80000000..0x82000000, initrd Some((82000000, 82000799)), DTB 0x9fe00000 (1772 bytes), 2 vCPUs
+[boot_linux] RAM 0x80000000..0xa0000000, kernel 0x80000000..0x82000000, initrd Some((82000000, 8200079a)), DTB 0x9fe00000 (1772 bytes), 2 vCPUs
 [boot_linux] cmdline: console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 panic=-1
+[boot_linux] vCPU 1: id 1, MPIDR 0x80000001, redistributor Ok(80c0000), GICR_TYPER Ok(100000110)
 [boot_linux] vCPU 0: id 0, MPIDR 0x80000000, redistributor Ok(80a0000), GICR_TYPER Ok(0)
 [boot_linux] vCPU 0: on at 0x80000000, x0 = 0x9fe00000
+[boot_linux] vCPU 0: PSCI 0x84000000(0x0, 0x0, 0x0) -> Return(10000)
+[boot_linux] vCPU 0: PSCI 0x84000006(0x0, 0x0, 0x0) -> Return(2)
+[boot_linux] vCPU 0: PSCI 0x8400000a(0x80000000, 0x0, 0x0) -> Return(ffffffffffffffff)
+[boot_linux] vCPU 0: PSCI 0x8400000a(0xc4000001, 0x0, 0x0) -> Return(0)
+[boot_linux] vCPU 0: PSCI 0x8400000a(0xc400000e, 0x0, 0x0) -> Return(ffffffffffffffff)
+[boot_linux] vCPU 0: PSCI 0x8400000a(0xc4000012, 0x0, 0x0) -> Return(ffffffffffffffff)
 [boot_linux] vCPU 0: PSCI 0xc4000003(0x1, 0x81890498, 0x0) -> Return(0)
 [boot_linux] vCPU 1: on at 0x81890498, x0 = 0x0
 [boot_linux] vCPU 0: PSCI 0x84000008(0x0, 0x0, 0x0) -> SystemOff
 [boot_linux] guest stopped: Ok(PowerOff)
 ```
+
+The end of the initrd depends on the size of the initramfs, and the lines of
+different vCPUs can come in a different order. The first `PSCI` calls are
+the kernel asking for the PSCI version (`0x84000000`), the migration type
+(`0x84000006`) and which functions exist (`0x8400000a`, `PSCI_FEATURES`); a
+return value of `ffffffffffffffff` (`NOT_SUPPORTED`) there is normal.
 
 ## Using your own kernel
 
@@ -443,10 +478,12 @@ must be built in (`=y`, not `=m`; there are no modules in the initramfs):
 `cloud-arm64` flavour. Check a configuration with:
 
 ```sh
-grep -E '^CONFIG_(SERIAL_AMBA_PL011_CONSOLE|SERIAL_EARLYCON|ARM_GIC_V3|ARM_ARCH_TIMER|ARM_PSCI_FW|SMP|BLK_DEV_INITRD|RD_GZIP|DEVTMPFS|BINFMT_SCRIPT)=' .config
+grep -E '^CONFIG_(SERIAL_AMBA_PL011|SERIAL_AMBA_PL011_CONSOLE|SERIAL_EARLYCON|ARM_GIC_V3|ARM_ARCH_TIMER|ARM_PSCI_FW|SMP|BLK_DEV_INITRD|RD_GZIP|DEVTMPFS|PROC_FS|SYSFS|BINFMT_ELF|BINFMT_SCRIPT)=' .config
 ```
 
-Every line must end in `=y`. For the downloaded kernel, the configuration is
+It must print 14 lines, one for each option in the table, and every line
+must end in `=y`. A missing line means the option is not set at all.
+For the downloaded kernel, the configuration is
 `target/boot-linux/Image.config`. A distribution kernel usually installs it
 as `/boot/config-<version>`; a kernel built with `CONFIG_IKCONFIG` contains
 it (`scripts/extract-ikconfig Image` in a kernel tree).
@@ -568,7 +605,11 @@ The host runs macOS 11 to 14. The `hvf` crate itself works there, but this
 VMM relies on the in-kernel interrupt controller. Update macOS.
 
 **Nothing at all on the console, but the VMM exits after a while or runs
-on.** The kernel prints nowhere the VMM can see:
+on.** The kernel prints nowhere the VMM can see. If `/init` powers off by
+itself (the Rust `/init`, or busybox with `hvf.autopoweroff`), the guest
+still boots and the VMM exits at once with status 0, printing only
+`boot_linux: the guest powered off`. A clean exit with no kernel log at all
+points to the console settings:
 - The kernel has no PL011 driver, or has it as a module. Firecracker's CI
   kernels, for example, boot and power off without printing anything. Check
   the options in [Requirements](#requirements).
@@ -620,6 +661,40 @@ needs.
 **`could not download ... from any mirror`, or a SHA-256 mismatch.** Check
 the network, then see
 [Updating the pinned downloads](#updating-the-pinned-downloads).
+
+**`^[[6n` after the prompt, or slow commands, when a script drives the
+shell.** Each time the busybox shell prints its prompt, it asks the terminal
+for the cursor position with `ESC [ 6 n`. A real terminal answers at once
+and shows nothing, so at the keyboard you never notice. A program that
+drives the console through a pty (`expect`, `script`, a CI job) sees the
+bytes `ESC[6n` right after `~ # ` and does not answer. With `script` fed
+from a pipe that only leaves the stray bytes in the log. With `expect`
+waiting for `"~ # "`, each command ran only when that `expect` reached its
+timeout, so every command took about as long as `set timeout`.
+
+Wait for the prompt together with the query and answer it, here with row
+24, column 5 (the prompt `~ # ` is 4 characters wide):
+
+```tcl
+proc prompt {} {
+    expect {
+        -ex "~ # \033\[6n" { send "\033\[24;5R" }
+        timeout { puts "no prompt"; exit 1 }
+    }
+}
+prompt
+send "uname -a\r"
+prompt
+send "exit\r"
+expect eof
+```
+
+The commands then run at once. Answer with a row other than 1: busybox
+can take `ESC[1;5R` for a function key (`Ctrl-F3`) and lose the input that
+follows. Setting `TERM=dumb` does not help; this busybox sends the query
+anyway. If the run needs no shell, boot with `hvf.autopoweroff` (see
+[Step 5](#step-5-boot-without-a-shell-on-more-vcpus)) or use the Rust
+`/init` instead.
 
 **The terminal behaves oddly after the VMM was killed.** The VMM restores
 the terminal when it exits normally, but not after `kill -9`. Type `reset`
