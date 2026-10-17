@@ -15,9 +15,10 @@
 //! in. The initramfs's `/init` must print `HVF-BOOT-OK` on the console and
 //! then power the machine off, for example with
 //! `reboot(LINUX_REBOOT_CMD_POWER_OFF)` or busybox's `poweroff -f`.
-//! `HVF_LINUX_CMDLINE` replaces the default command line. Without
-//! `HVF_LINUX_KERNEL` and `HVF_LINUX_INITRD` the test prints `SKIP` and
-//! passes.
+//! `HVF_LINUX_CMDLINE` replaces the default command line. The test fails
+//! without `HVF_LINUX_KERNEL` and `HVF_LINUX_INITRD`: it runs only when
+//! asked for, and a skip would be indistinguishable from a boot, because
+//! libtest hides what a passing test prints.
 //!
 //! The file also runs the unit tests of the example's modules, which need
 //! no hypervisor.
@@ -78,8 +79,7 @@ fn test_boot_linux_to_userspace() {
         std::env::var_os("HVF_LINUX_KERNEL"),
         std::env::var_os("HVF_LINUX_INITRD"),
     ) else {
-        println!("SKIP: set HVF_LINUX_KERNEL and HVF_LINUX_INITRD to boot Linux");
-        return;
+        panic!("set HVF_LINUX_KERNEL and HVF_LINUX_INITRD (absolute paths) to boot Linux");
     };
     let Some(_g) = common::hv_guard() else {
         return;
