@@ -224,14 +224,10 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Hv { err, .. } => Some(err),
-            _ => None,
-        }
-    }
-}
+// The `Display` of `Error::Hv` already includes the `HvError`, so `source()`
+// does not return it as well: error-chain reporters would print it twice.
+// Match `Error::Hv { err, .. }` to get the code.
+impl std::error::Error for Error {}
 
 impl From<Error> for io::Error {
     /// Converts to an [`io::Error`] that keeps `e` as its inner error. The
@@ -416,12 +412,15 @@ mod tests {
     fn test_error_source() {
         use std::error::Error as _;
 
+        // The code is part of the message, so it is not also the source,
+        // which a chain reporter would print a second time.
         let e = Error::Hv {
             call: "hv_vcpu_run",
             err: HvError(HV_ERROR),
         };
-        let source = e.source().unwrap().downcast_ref::<HvError>().unwrap();
-        assert_eq!(*source, HvError(HV_ERROR));
+        assert!(e.source().is_none());
+        assert!(e.to_string().contains(&HvError(HV_ERROR).to_string()));
+        assert!(io::Error::from(e).source().is_none());
         assert!(Error::VmExists.source().is_none());
     }
 
