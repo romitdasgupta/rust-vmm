@@ -15,10 +15,12 @@
 
 mod common;
 
+use std::thread;
 use std::time::Duration;
 
 use common::{
-    ERET, GUEST_IPA, GuestRam, SPIN, boot_vcpu, expect_exception, hv_guard, hvc, kick_after,
+    ERET, GUEST_IPA, GuestRam, SPIN, boot_vcpu, expect_exception, hv_guard, hvc, run_until_kicked,
+    run_until_kicked_with,
 };
 use hvf::{ExceptionClass, Hvf, InterruptType, Reg, SysReg, Vcpu, VcpuExit, VmConfig};
 
@@ -76,14 +78,6 @@ fn ready_vcpu(vm: &hvf::Vm) -> Vcpu {
     // PSTATE.I and PSTATE.F are clear.
     assert_eq!(vcpu.get_reg(Reg::CPSR).unwrap() & 0xc0, 0);
     vcpu
-}
-
-/// Runs a vCPU that is expected to spin until kicked.
-fn run_until_kicked(vcpu: &mut Vcpu) -> VcpuExit {
-    let kicked = kick_after(vcpu.kicker(), Duration::from_millis(50));
-    let exit = vcpu.run().unwrap();
-    kicked.recv().unwrap().unwrap();
-    exit
 }
 
 #[test]
@@ -193,5 +187,33 @@ fn test_level_irq_rearmed_before_each_run() {
     }
     // A level held across runs interrupted the guest after every `eret`.
     assert_eq!(irqs_taken, 3);
+    assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), GUEST_IPA + SPIN_LOOP);
+}
+
+/// Regression test for A5-3: a kick that lands before the run enters the
+/// guest must not make `run_until_kicked` return before the guest ran.
+#[test]
+fn test_run_until_kicked_after_early_kick() {
+    let Some(_g) = hv_guard() else { return };
+    let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
+    let _code = load_guest(&vm);
+    let mut vcpu = ready_vcpu(&vm);
+
+    vcpu.set_pending_interrupt(InterruptType::Irq, true)
+        .unwrap();
+    assert_eq!(
+        expect_exception(vcpu.run().unwrap()),
+        ExceptionClass::Hvc { imm: 1 }
+    );
+    // The guest stopped in its IRQ handler, before its `eret`. Delay the
+    // first run past the kick, as a test thread descheduled on a loaded host
+    // would: the remembered kick cancels that run before the guest runs.
+    let exit = run_until_kicked_with(&mut vcpu, |attempt| {
+        if attempt == 0 {
+            thread::sleep(Duration::from_millis(150));
+        }
+    });
+    assert_eq!(exit, VcpuExit::Canceled);
+    // The guest still returned to its spin loop.
     assert_eq!(vcpu.get_reg(Reg::PC).unwrap(), GUEST_IPA + SPIN_LOOP);
 }

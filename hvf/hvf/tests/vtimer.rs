@@ -16,20 +16,15 @@ mod common;
 
 use std::time::Duration;
 
-use common::{GUEST_IPA, GuestRam, SPIN, boot_vcpu, hv_guard, kick_after, mach_time};
-use hvf::{Hvf, SysReg, Vcpu, VcpuExit, VmConfig};
+use common::{
+    GUEST_IPA, GuestRam, SPIN, boot_vcpu, hv_guard, kick_after, mach_time, run_until_kicked,
+};
+use hvf::{Hvf, SysReg, VcpuExit, VmConfig};
 
 /// `CNTV_CTL_EL0.ENABLE`
 const CTL_ENABLE: u64 = 1;
 /// `CNTV_CTL_EL0.ISTATUS`
 const CTL_ISTATUS: u64 = 1 << 2;
-
-fn run_until_kicked(vcpu: &mut Vcpu) -> VcpuExit {
-    let kicked = kick_after(vcpu.kicker(), Duration::from_millis(50));
-    let exit = vcpu.run().unwrap();
-    kicked.recv().unwrap().unwrap();
-    exit
-}
 
 #[test]
 fn test_vtimer_exit_and_mask() {

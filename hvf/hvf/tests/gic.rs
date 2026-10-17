@@ -12,10 +12,10 @@ mod common;
 
 use std::thread;
 
-use common::hv_guard;
+use common::{CPSR_EL1H_MASKED, GUEST_IPA, GuestRam, SPIN, hv_guard, hvc};
 use hvf::{
-    Error, Gic, GicConfig, GicIntid, GicParams, Hvf, InterruptType, MemoryFlags, MsiConfig, Reg,
-    SysReg, Vcpu, VcpuExit, Vm, VmConfig,
+    Error, Gic, GicConfig, GicIntid, GicParams, Hvf, InterruptType, MsiConfig, Reg, SysReg, Vcpu,
+    VcpuExit, Vm, VmConfig,
 };
 use hvf_bindings as hv;
 
@@ -24,11 +24,6 @@ const REDIST_BASE: u64 = 0x080a_0000;
 const MSI_BASE: u64 = 0x0802_0000;
 const MSI_INTID_BASE: u32 = 64;
 const MSI_INTID_COUNT: u32 = 64;
-
-/// Guest physical address of the guest code in [`Guest`].
-const GUEST_IPA: u64 = 0x4000_0000;
-/// `hvc #0; b .`
-const HVC: [u8; 8] = [0x02, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x00, 0x14];
 
 /// The layout used by most tests.
 const LAYOUT: GicConfig = GicConfig {
@@ -75,59 +70,6 @@ fn assert_hv_err<T: std::fmt::Debug>(r: hvf::Result<T>, call: &str, code: hv::hv
     match r {
         Err(Error::Hv { call: c, err }) if c == call && err.0 == code => {}
         r => panic!("expected {call} to fail with {code:#x}, got {r:?}"),
-    }
-}
-
-/// One granule of guest code mapped at [`GUEST_IPA`], unmapped and freed on
-/// drop.
-struct Guest {
-    vm: Vm,
-    host: *mut libc::c_void,
-    size: usize,
-}
-
-impl Guest {
-    fn new(vm: &Vm, code: &[u8]) -> Guest {
-        let size = vm.ipa_granule() as usize;
-        // SAFETY: an anonymous private mapping has no preconditions; the
-        // result is checked below.
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(host, libc::MAP_FAILED);
-        // SAFETY: `host` is a fresh mapping of `size >= code.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host.cast(), code.len()) };
-        // SAFETY: the mapping lives until `drop`, which unmaps it from the
-        // guest first, and the host does not touch it in between.
-        unsafe {
-            vm.map(
-                host.cast(),
-                GUEST_IPA,
-                size,
-                MemoryFlags::READ | MemoryFlags::EXEC,
-            )
-        }
-        .unwrap();
-        Guest {
-            vm: vm.clone(),
-            host,
-            size,
-        }
-    }
-}
-
-impl Drop for Guest {
-    fn drop(&mut self) {
-        self.vm.unmap(GUEST_IPA, self.size).unwrap();
-        // SAFETY: the guest mapping was removed above.
-        unsafe { libc::munmap(self.host, self.size) };
     }
 }
 
@@ -513,9 +455,9 @@ fn test_save_restore_state() {
     ));
 
     // The restored VM runs.
-    let _guest = Guest::new(&vm, &HVC);
+    let _guest = GuestRam::with_code(&vm, &[hvc(0), SPIN]);
     vcpu.set_reg(Reg::PC, GUEST_IPA).unwrap();
-    vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
+    vcpu.set_reg(Reg::CPSR, CPSR_EL1H_MASKED).unwrap();
     let exit = vcpu.run().unwrap();
     assert!(matches!(exit, VcpuExit::Exception(_)), "{exit:?}");
 }
@@ -531,9 +473,9 @@ fn test_restore_state_after_run() {
     let state = gic.save_state().unwrap();
     gic.set_distributor_reg(MARKER_REG, MARKER).unwrap();
 
-    let _guest = Guest::new(&vm, &HVC);
+    let _guest = GuestRam::with_code(&vm, &[hvc(0), SPIN]);
     vcpu.set_reg(Reg::PC, GUEST_IPA).unwrap();
-    vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
+    vcpu.set_reg(Reg::CPSR, CPSR_EL1H_MASKED).unwrap();
     let exit = vcpu.run().unwrap();
     assert!(matches!(exit, VcpuExit::Exception(_)), "{exit:?}");
 

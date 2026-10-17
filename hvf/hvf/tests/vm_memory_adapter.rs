@@ -4,14 +4,14 @@
 //! `Vm::map_guest_memory` (feature `vm-memory`): mapping, validation and
 //! rollback.
 //!
-//! Needs real Hypervisor.framework access; the tests print `SKIP: ...` and
-//! pass when it is unusable, unless `HVF_REQUIRE=1` is set.
+//! Needs real Hypervisor.framework access; see `common::hv_guard`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64", feature = "vm-memory"))]
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+mod common;
 
-use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Reg, VcpuExit, Vm, VmConfig};
+use common::{boot_vcpu, expect_exception, hv_guard};
+use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Vm, VmConfig};
 use vm_memory::{
     Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion,
     GuestMemoryRegionBytes, GuestRegionMmap, GuestUsize, MmapRegion,
@@ -28,34 +28,22 @@ const GUEST: [u32; 4] = [0xd2b0_0001, 0x5280_0840, 0xb900_0020, 0xd400_0002];
 
 type Mem = GuestMemoryMmap<()>;
 
-/// Serializes the tests of this binary (one VM per process) and skips them
-/// when Hypervisor.framework is unusable, or panics then if `HVF_REQUIRE=1`.
-fn hv_guard() -> Option<MutexGuard<'static, ()>> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let require = std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1");
-    let reason = if !Hvf::is_supported() {
-        "kern.hv_support is not 1".to_string()
-    } else {
-        match Hvf::create_vm(&VmConfig::default()) {
-            Ok(_) => return Some(guard),
-            Err(Error::Hv { err, .. }) if err.is_unavailable() => err.to_string(),
-            Err(e) => panic!("cannot create a VM: {e}"),
-        }
-    };
-    assert!(!require, "HVF_REQUIRE=1 but HVF is unusable: {reason}");
-    println!("SKIP: Hypervisor.framework is unusable: {reason}");
-    None
-}
-
 fn create_vm() -> Vm {
     Hvf::create_vm(&VmConfig::default()).unwrap()
 }
 
-/// One granule of anonymous memory at each of `ipas`.
-fn guest_memory(vm: &Vm, ipas: &[u64]) -> Mem {
-    let size = vm.ipa_granule() as usize;
-    let ranges: Vec<_> = ipas.iter().map(|&ipa| (GuestAddress(ipa), size)).collect();
+/// Size of each region of [`guest_memory`]: a multiple of every IPA granule.
+const REGION_SIZE: usize = 0x1_0000;
+
+/// [`REGION_SIZE`] bytes of anonymous memory at each of `ipas`.
+///
+/// Create it before the VM, so that it is dropped after it: memory mapped
+/// into a guest must stay alive until it is unmapped or the VM is gone.
+fn guest_memory(ipas: &[u64]) -> Mem {
+    let ranges: Vec<_> = ipas
+        .iter()
+        .map(|&ipa| (GuestAddress(ipa), REGION_SIZE))
+        .collect();
     Mem::from_ranges(&ranges).unwrap()
 }
 
@@ -116,37 +104,29 @@ impl GuestMemoryRegionBytes for NoHostRegion {}
 #[test]
 fn test_map_guest_memory_runs_guest() {
     let Some(_g) = hv_guard() else { return };
+    let mem = guest_memory(&[CODE_IPA, DATA_IPA]);
     let vm = create_vm();
-    let mem = guest_memory(&vm, &[CODE_IPA, DATA_IPA]);
     for (i, insn) in GUEST.iter().enumerate() {
         mem.write_obj(*insn, GuestAddress(CODE_IPA + 4 * i as u64))
             .unwrap();
     }
-    // SAFETY: `mem` outlives the VM, which is dropped at the end of the test,
-    // and is only accessed through `Bytes`.
+    // SAFETY: `mem` was created before the VM, so it outlives it, and it is
+    // only accessed through `Bytes`.
     unsafe { vm.map_guest_memory(&mem, MemoryFlags::RWX).unwrap() };
 
-    let mut vcpu = vm.create_vcpu(None).unwrap();
-    vcpu.set_reg(Reg::PC, CODE_IPA).unwrap();
-    vcpu.set_reg(Reg::CPSR, 0x3c5).unwrap();
-    match vcpu.run().unwrap() {
-        VcpuExit::Exception(e) => {
-            assert!(
-                matches!(e.decode(), ExceptionClass::Hvc { imm: 0 }),
-                "{e:?}"
-            )
-        }
-        other => panic!("unexpected exit: {other:?}"),
-    }
+    let mut vcpu = boot_vcpu(&vm, CODE_IPA);
+    assert_eq!(
+        expect_exception(vcpu.run().unwrap()),
+        ExceptionClass::Hvc { imm: 0 }
+    );
     assert_eq!(mem.read_obj::<u32>(GuestAddress(DATA_IPA)).unwrap(), 0x42);
     drop(vcpu);
 
     // Every region is mapped separately and can be unmapped on its own.
-    let size = vm.ipa_granule() as usize;
     for ipa in [CODE_IPA, DATA_IPA] {
-        assert!(!ipa_range_is_free(&vm, ipa, size));
-        vm.unmap(ipa, size).unwrap();
-        assert!(ipa_range_is_free(&vm, ipa, size));
+        assert!(!ipa_range_is_free(&vm, ipa, REGION_SIZE));
+        vm.unmap(ipa, REGION_SIZE).unwrap();
+        assert!(ipa_range_is_free(&vm, ipa, REGION_SIZE));
     }
 }
 
@@ -162,12 +142,14 @@ fn test_map_guest_memory_empty() {
 #[test]
 fn test_map_guest_memory_rollback() {
     let Some(_g) = hv_guard() else { return };
+    let size = REGION_SIZE;
+    // Both are created before the VM, so they outlive it even if the test
+    // fails while they are mapped.
+    let mem = guest_memory(&[CODE_IPA, DATA_IPA]);
+    let blocker = MmapRegion::<()>::new(size).unwrap();
     let vm = create_vm();
-    let size = vm.ipa_granule() as usize;
-    let mem = guest_memory(&vm, &[CODE_IPA, DATA_IPA]);
 
     // Occupy the guest range of the second region.
-    let blocker = MmapRegion::<()>::new(size).unwrap();
     // SAFETY: `blocker` outlives the VM, and the guest never runs.
     unsafe {
         vm.map(blocker.as_ptr(), DATA_IPA, size, MemoryFlags::RW)

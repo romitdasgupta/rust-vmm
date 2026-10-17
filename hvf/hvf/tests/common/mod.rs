@@ -8,15 +8,14 @@
 
 #![allow(dead_code)]
 
-use std::fs::File;
 use std::mem::ManuallyDrop;
-use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use hvf::{Error, ExceptionClass, Hvf, MemoryFlags, Reg, Vcpu, VcpuExit, VcpuKicker, Vm, VmConfig};
+use vm_memory::{MmapRegion, VolatileMemory};
 
 /// Guest physical address the test guests are loaded at.
 pub const GUEST_IPA: u64 = 0x4000_0000;
@@ -65,6 +64,13 @@ pub const MMIO_GUEST: [u32; 9] = [
 /// Base of the MMIO region [`MMIO_GUEST`] accesses.
 pub const MMIO_BASE: u64 = 0x0900_0000;
 
+/// Whether the environment variable `HVF_REQUIRE=1` is set: CI sets it so
+/// that a host on which Hypervisor.framework is unusable fails the tests
+/// instead of skipping them.
+pub fn hvf_required() -> bool {
+    std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1")
+}
+
 /// Serializes the HVF tests of one test binary (one VM per process) and skips
 /// them when Hypervisor.framework is unusable.
 ///
@@ -77,7 +83,6 @@ pub fn hv_guard() -> Option<MutexGuard<'static, ()>> {
     // A test that failed while holding the lock leaves nothing behind that
     // the next test cares about: its VM was dropped while unwinding.
     let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let require = std::env::var_os("HVF_REQUIRE").is_some_and(|v| v == "1");
     let reason = if !Hvf::is_supported() {
         "kern.hv_support is not 1".to_string()
     } else {
@@ -88,108 +93,21 @@ pub fn hv_guard() -> Option<MutexGuard<'static, ()>> {
             Err(e) => panic!("cannot create a probe VM: {e}"),
         }
     };
-    assert!(!require, "HVF_REQUIRE=1 but HVF is unusable: {reason}");
+    assert!(
+        !hvf_required(),
+        "HVF_REQUIRE=1 but HVF is unusable: {reason}"
+    );
     println!("SKIP: Hypervisor.framework is unusable: {reason}");
     None
 }
 
-/// A host memory mapping (anonymous or of a file), unmapped on drop.
+/// Writes 32-bit words (for example instructions) at `offset` of `mem`.
 ///
-/// The host accesses it only through volatile operations, so it may be mapped
-/// into a guest; the test must then remove the guest mapping before dropping
-/// it, or use [`GuestRam`], which does so itself.
-#[derive(Debug)]
-pub struct HostMem {
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl HostMem {
-    /// Maps `size` bytes of zeroed anonymous memory.
-    pub fn anon(size: usize) -> HostMem {
-        // SAFETY: an anonymous private mapping has no preconditions; the
-        // result is checked below.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED, "mmap of {size:#x} bytes failed");
-        HostMem {
-            ptr: ptr.cast(),
-            size,
-        }
-    }
-
-    /// Maps the first `size` bytes of `file` with protection `prot` and
-    /// mapping flags `flags` (for example `MAP_SHARED`).
-    pub fn file(file: &File, size: usize, prot: i32, flags: i32) -> HostMem {
-        // SAFETY: a file mapping at an address chosen by the kernel does not
-        // affect existing memory; the result is checked below.
-        let ptr =
-            unsafe { libc::mmap(std::ptr::null_mut(), size, prot, flags, file.as_raw_fd(), 0) };
-        assert_ne!(ptr, libc::MAP_FAILED, "mmap of {size:#x} file bytes failed");
-        HostMem {
-            ptr: ptr.cast(),
-            size,
-        }
-    }
-
-    /// The start of the mapping.
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    /// The size of the mapping.
-    pub fn len(&self) -> usize {
-        self.size
-    }
-
-    /// Writes 32-bit words (for example instructions) at `offset`.
-    ///
-    /// Uses volatile accesses, so it may be called while the memory is mapped
-    /// into a guest.
-    pub fn write_u32s(&self, offset: usize, words: &[u32]) {
-        assert!(offset.is_multiple_of(4) && offset + 4 * words.len() <= self.size);
-        for (i, word) in words.iter().enumerate() {
-            // SAFETY: in bounds and aligned (checked above, and the mapping is
-            // page aligned); the memory is only ever accessed with volatile
-            // operations by the host.
-            unsafe {
-                self.ptr
-                    .add(offset + 4 * i)
-                    .cast::<u32>()
-                    .write_volatile(*word)
-            };
-        }
-    }
-
-    /// Reads the 32-bit word at `offset` with a volatile access.
-    pub fn read_u32(&self, offset: usize) -> u32 {
-        assert!(offset.is_multiple_of(4) && offset + 4 <= self.size);
-        // SAFETY: in bounds and aligned; volatile access as in `write_u32s`.
-        unsafe { self.ptr.add(offset).cast::<u32>().read_volatile() }
-    }
-
-    /// Reads the 64-bit word at `offset` with a volatile access.
-    pub fn read_u64(&self, offset: usize) -> u64 {
-        assert!(offset.is_multiple_of(8) && offset + 8 <= self.size);
-        // SAFETY: in bounds and aligned; volatile access as in `write_u32s`.
-        unsafe { self.ptr.add(offset).cast::<u64>().read_volatile() }
-    }
-}
-
-impl Drop for HostMem {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` is a mapping of `size` bytes owned by `self`. Users of
-        // `HostMem` keep it alive until it is no longer mapped into a guest
-        // (see `GuestRam`).
-        unsafe { libc::munmap(self.ptr.cast(), self.size) };
+/// Uses volatile accesses, so it may be called while the memory is mapped
+/// into a guest.
+pub fn write_u32s(mem: &MmapRegion<()>, offset: usize, words: &[u32]) {
+    for (i, word) in words.iter().enumerate() {
+        mem.get_ref::<u32>(offset + 4 * i).unwrap().store(*word);
     }
 }
 
@@ -204,13 +122,13 @@ pub struct GuestRam {
     vm: Vm,
     ipa: u64,
     mapped: bool,
-    mem: ManuallyDrop<HostMem>,
+    mem: ManuallyDrop<MmapRegion<()>>,
 }
 
 impl GuestRam {
     /// Maps `size` bytes of fresh anonymous memory at `ipa` with `flags`.
     pub fn new(vm: &Vm, ipa: u64, size: usize, flags: MemoryFlags) -> GuestRam {
-        let mem = HostMem::anon(size);
+        let mem = MmapRegion::<()>::new(size).unwrap();
         // SAFETY: `mem` stays mapped until `drop`, which first removes the
         // guest mapping, and the host only accesses it with volatile
         // operations.
@@ -240,28 +158,28 @@ impl GuestRam {
 
     /// The size of the memory.
     pub fn len(&self) -> usize {
-        self.mem.len()
+        self.mem.size()
     }
 
-    /// Writes 32-bit words at `offset`, see [`HostMem::write_u32s`].
+    /// Writes 32-bit words at `offset`, see [`write_u32s`].
     pub fn write_u32s(&self, offset: usize, words: &[u32]) {
-        self.mem.write_u32s(offset, words);
+        write_u32s(&self.mem, offset, words);
     }
 
-    /// Reads the 32-bit word at `offset`, see [`HostMem::read_u32`].
+    /// Reads the 32-bit word at `offset` with a volatile access.
     pub fn read_u32(&self, offset: usize) -> u32 {
-        self.mem.read_u32(offset)
+        self.mem.get_ref::<u32>(offset).unwrap().load()
     }
 
-    /// Reads the 64-bit word at `offset`, see [`HostMem::read_u64`].
+    /// Reads the 64-bit word at `offset` with a volatile access.
     pub fn read_u64(&self, offset: usize) -> u64 {
-        self.mem.read_u64(offset)
+        self.mem.get_ref::<u64>(offset).unwrap().load()
     }
 
     /// Removes the guest mapping now, for tests that observe the unmap.
     pub fn unmap(&mut self) -> hvf::Result<()> {
         assert!(self.mapped, "already unmapped");
-        self.vm.unmap(self.ipa, self.mem.len())?;
+        self.vm.unmap(self.ipa, self.mem.size())?;
         self.mapped = false;
         Ok(())
     }
@@ -269,7 +187,7 @@ impl GuestRam {
 
 impl Drop for GuestRam {
     fn drop(&mut self) {
-        if self.mapped && self.vm.unmap(self.ipa, self.mem.len()).is_err() {
+        if self.mapped && self.vm.unmap(self.ipa, self.mem.size()).is_err() {
             // The guest may still reach the memory: leak it rather than
             // freeing memory a guest can write.
             eprintln!("GuestRam: unmap of {:#x} failed, leaking it", self.ipa);
@@ -310,6 +228,36 @@ pub fn kick_after(kicker: VcpuKicker, delay: Duration) -> mpsc::Receiver<hvf::Re
         let _ = tx.send(kicker.kick());
     });
     rx
+}
+
+/// Runs a vCPU whose guest is expected to spin until kicked, kicking it after
+/// 50 ms, and returns the exit.
+///
+/// A kick that lands before [`Vcpu::run`] enters the guest, for example when
+/// the test thread is descheduled for longer than the delay, is remembered
+/// and cancels the run before any guest code runs. Such a run is retried, so
+/// that the caller sees the state of a guest that really ran: a `Canceled`
+/// run that did not add to [`Vcpu::exec_time`] never entered the guest.
+pub fn run_until_kicked(vcpu: &mut Vcpu) -> VcpuExit {
+    run_until_kicked_with(vcpu, |_| {})
+}
+
+/// [`run_until_kicked`], calling `before_run` with the attempt number right
+/// before each run, so tests can delay the run past the kick.
+pub fn run_until_kicked_with(vcpu: &mut Vcpu, mut before_run: impl FnMut(usize)) -> VcpuExit {
+    for attempt in 0..10 {
+        let before = vcpu.exec_time().unwrap();
+        let kicked = kick_after(vcpu.kicker(), Duration::from_millis(50));
+        before_run(attempt);
+        let exit = vcpu.run().unwrap();
+        // The kick was consumed: either by this run, or, if it landed
+        // before the run, by cancelling it at entry.
+        kicked.recv().unwrap().unwrap();
+        if exit != VcpuExit::Canceled || vcpu.exec_time().unwrap() != before {
+            return exit;
+        }
+    }
+    panic!("every run was cancelled before the guest ran");
 }
 
 /// Mach absolute time, the time base of the vCPU's virtual counter.
