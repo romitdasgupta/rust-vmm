@@ -26,13 +26,17 @@
 #   buildkite-agent pipeline upload .buildkite/pipeline.macos.yml
 #
 # Until such agents exist, maintainers run these commands locally on an Apple
-# silicon Mac before every hvf-bindings or hvf release.
+# silicon Mac before every hvf-bindings or hvf release. Clippy and the SDK
+# check need no hypervisor, so they run on GitHub's hosted macOS runners
+# (.github/workflows/macos.yml) rather than here.
 
 agents:
   queue: "macos-arm64"
 
 env:
   HVF_REQUIRE: "1"
+  # The unittests steps run tests/sdk_check.rs; fail it if xcrun is missing.
+  HVF_SDK_CHECK: "1"
   CARGO_TERM_COLOR: "always"
 
 steps:
@@ -54,18 +58,8 @@ steps:
     command: "cargo test -p hvf-bindings -p hvf --all-features --release"
     timeout_in_minutes: 30
 
-  - label: "hvf: sdk-check"
-    command: "cargo test -p hvf-bindings --test sdk_check"
-    env:
-      HVF_SDK_CHECK: "1"
-    timeout_in_minutes: 15
-
   - label: "hvf: example-mmio_guest"
     command: "cargo run -p hvf --example mmio_guest"
-    timeout_in_minutes: 15
-
-  - label: "hvf: clippy"
-    command: "cargo clippy -p hvf-bindings -p hvf --all-targets --all-features -- -D warnings -D clippy::undocumented_unsafe_blocks"
     timeout_in_minutes: 15
 
   # Informational only: the coverage scores enforced by CI are the Linux ones
