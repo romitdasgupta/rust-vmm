@@ -101,7 +101,7 @@ them to `target/boot-linux/`. An initramfs whose `/init` prints
 `reboot(LINUX_REBOOT_CMD_POWER_OFF)` or `poweroff -f`, can be checked with the
 ignored test in [`tests/boot_linux.rs`](tests/boot_linux.rs). The test boots
 with 1 and 4 vCPUs. It runs in `hvf/hvf`, so give absolute paths. Without the
-variables it prints `SKIP` and passes. With the busybox initramfs, whose
+variables the test fails. With the busybox initramfs, whose
 `/init` powers off only when asked to:
 
 ```sh
