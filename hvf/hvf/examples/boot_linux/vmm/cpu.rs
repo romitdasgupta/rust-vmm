@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use hvf::{DataAbort, Exception, ExceptionClass, Reg, SysReg, Vcpu, VcpuExit};
 use vm_device::bus::MmioAddress;
+use vm_device::device_manager::MmioManager;
 
 use super::psci::{self, Action};
 use super::{Machine, Outcome, Result, sysreg};
@@ -252,30 +253,22 @@ fn mmio(
         .into());
     };
     let len = usize::from(access.len);
-    let device = machine.bus.check_access(MmioAddress(abort.ipa), len).ok();
+    let addr = MmioAddress(abort.ipa);
+    // An access that no device claims fails before touching `bytes`: writes
+    // are dropped and reads return zero.
     if abort.write {
         let value = vcpu.mmio_write_value(&access)?;
-        match device {
-            Some((range, dev)) => {
-                dev.mmio_write(
-                    range.base(),
-                    abort.ipa - range.base().0,
-                    &value.to_le_bytes()[..len],
-                );
-            }
-            None => machine.warn_once(format!(
+        if machine.bus.mmio_write(addr, &value.to_le_bytes()[..len]).is_err() {
+            machine.warn_once(format!(
                 "ignored {len}-byte MMIO write of {value:#x} to {:#x}",
                 abort.ipa
-            )),
+            ));
         }
         vcpu.advance_pc()?;
     } else {
         let mut bytes = [0u8; 8];
-        match device {
-            Some((range, dev)) => {
-                dev.mmio_read(range.base(), abort.ipa - range.base().0, &mut bytes[..len]);
-            }
-            None => machine.warn_once(format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa)),
+        if machine.bus.mmio_read(addr, &mut bytes[..len]).is_err() {
+            machine.warn_once(format!("RAZ {len}-byte MMIO read from {:#x}", abort.ipa));
         }
         vcpu.complete_mmio_read(&access, u64::from_le_bytes(bytes))?;
     }

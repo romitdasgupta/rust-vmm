@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 use hvf::{GicConfig, GicIntid, Hvf, MemoryFlags, Vcpu, VcpuKicker, Vm, VmConfig};
 use linux_loader::cmdline::Cmdline;
 use linux_loader::loader::{KernelLoader, PE};
-use vm_device::DeviceMmio;
-use vm_device::bus::{Bus, BusRange, MmioAddress};
+use vm_device::bus::{BusRange, MmioAddress};
+use vm_device::device_manager::{IoManager, MmioManager};
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 use layout::{DTB_MAX_SIZE, GICD_BASE, GICR_BASE, RAM_BASE, SZ_2M, UART_BASE, UART_SIZE, UART_SPI};
@@ -110,12 +110,10 @@ impl Log {
     }
 }
 
-type MmioBus = Bus<MmioAddress, Arc<dyn DeviceMmio + Send + Sync>>;
-
 /// State shared by the vCPU threads.
 pub struct Machine {
     vm: Vm,
-    bus: MmioBus,
+    bus: IoManager,
     console: Arc<Pl011>,
     cpus: psci::Cpus,
     kickers: Mutex<Vec<Option<VcpuKicker>>>,
@@ -427,8 +425,8 @@ pub fn run(cfg: Config) -> Result<Outcome> {
             }
         }),
     )?;
-    let mut bus = MmioBus::new();
-    bus.register(
+    let mut bus = IoManager::new();
+    bus.register_mmio(
         BusRange::new(MmioAddress(UART_BASE), UART_SIZE)?,
         console.clone(),
     )?;
