@@ -519,12 +519,19 @@ pub(crate) mod tests {
         }
         assert!(Hvf::max_vcpu_count().unwrap() >= 1);
 
-        let max = Hvf::max_ipa_bits().unwrap();
-        let default = Hvf::default_ipa_bits().unwrap();
-        assert!((32..=52).contains(&max), "{max}");
-        assert!(default <= max, "{default} > {max}");
-
-        // Newer probes either work or report the release they need.
+        // Newer probes either work or report the release they need. The
+        // crate supports macOS 11.0; the IPA size probes need 13.0.
+        match (Hvf::max_ipa_bits(), Hvf::default_ipa_bits()) {
+            (Ok(max), Ok(default)) => {
+                assert!((32..=52).contains(&max), "{max}");
+                assert!(default <= max, "{default} > {max}");
+            }
+            (
+                Err(Error::Unavailable { since: (13, 0), .. }),
+                Err(Error::Unavailable { since: (13, 0), .. }),
+            ) => {}
+            r => panic!("{r:?}"),
+        }
         match Hvf::el2_supported() {
             Ok(_) | Err(Error::Unavailable { since: (15, 0), .. }) => {}
             Err(e) => panic!("{e}"),
@@ -587,7 +594,9 @@ pub(crate) mod tests {
     fn test_create_vm_default() {
         let Some(_g) = hv_test_lock() else { return };
         let vm = Hvf::create_vm(&VmConfig::default()).unwrap();
-        assert_eq!(vm.ipa_bits(), Hvf::default_ipa_bits().unwrap());
+        // Before macOS 13.0 there is no probe, and the size is 36 bits.
+        let ipa_bits = or_if_unavailable(Hvf::default_ipa_bits(), LEGACY_IPA_BITS).unwrap();
+        assert_eq!(vm.ipa_bits(), ipa_bits);
         let granule = or_if_unavailable(Hvf::default_ipa_granule(), IpaGranule::K16).unwrap();
         assert_eq!(vm.ipa_granule(), granule.bytes());
         assert!(!vm.el2_enabled());
