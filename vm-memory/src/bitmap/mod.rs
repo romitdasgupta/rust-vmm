@@ -306,9 +306,9 @@ pub(crate) mod tests {
     }
 
     // Tests a `VolatileMemory` implementation whose bitmap tracks at a granularity no coarser
-    // than the host page size. It assumes `m` covers at least 4 host pages.
-    pub fn test_volatile_memory<M: VolatileMemory>(m: &M) {
-        let page_size = crate::page_size();
+    // than `page_size`: the host page size for mmap-backed memory, or the page size of the
+    // bitmap otherwise. It assumes `m` covers at least 4 such pages.
+    pub fn test_volatile_memory<M: VolatileMemory>(m: &M, page_size: usize) {
         assert!(m.len() >= 4 * page_size);
 
         let dirty_offset = page_size;

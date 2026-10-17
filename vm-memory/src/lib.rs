@@ -28,8 +28,8 @@ compile_error!("vm-memory only supports 64-bit targets!");
 #[cfg(all(target_family = "windows", feature = "rawfd"))]
 compile_error!("rawfd feature is not supported on Windows targets!");
 
-#[cfg(all(not(target_os = "linux"), feature = "xen"))]
-compile_error!("xen feature is only supported on Linux targets!");
+#[cfg(all(not(any(target_os = "linux", target_os = "android")), feature = "xen"))]
+compile_error!("xen feature is only supported on Linux and Android targets!");
 
 #[macro_use]
 pub mod address;

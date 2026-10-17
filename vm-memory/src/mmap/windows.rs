@@ -266,6 +266,6 @@ mod tests {
         // Using the `crate` prefix because we aliased `MmapRegion` to `MmapRegion<()>` for
         // the rest of the unit tests above.
         let m = crate::MmapRegion::<AtomicBitmap>::new(0x1_0000).unwrap();
-        crate::bitmap::tests::test_volatile_memory(&m);
+        crate::bitmap::tests::test_volatile_memory(&m, crate::page_size());
     }
 }

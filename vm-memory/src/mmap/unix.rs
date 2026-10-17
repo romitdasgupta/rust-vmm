@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(builder.hugetlbfs, Some(true));
         assert_eq!(builder.prot, libc::PROT_READ | libc::PROT_WRITE);
 
-        crate::bitmap::tests::test_volatile_memory(&(builder.build().unwrap()));
+        crate::bitmap::tests::test_volatile_memory(&(builder.build().unwrap()), page_size);
     }
 
     #[test]
@@ -666,6 +666,6 @@ mod tests {
         // Using the `crate` prefix because we aliased `MmapRegion` to `MmapRegion<()>` for
         // the rest of the unit tests above.
         let m = crate::MmapRegion::<AtomicBitmap>::new(4 * crate::page_size()).unwrap();
-        crate::bitmap::tests::test_volatile_memory(&m);
+        crate::bitmap::tests::test_volatile_memory(&m, crate::page_size());
     }
 }

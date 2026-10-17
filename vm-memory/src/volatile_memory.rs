@@ -2185,7 +2185,8 @@ mod tests {
         {
             let bitmap = AtomicBitmap::new(len, DEFAULT_PAGE_SIZE);
             let slice = unsafe { VolatileSlice::with_bitmap(buf, len, bitmap.slice_at(0), None) };
-            test_volatile_memory(&slice);
+            // The bitmap tracks 4 KiB pages whatever the host page size.
+            test_volatile_memory(&slice, DEFAULT_PAGE_SIZE.get());
         }
 
         let bitmap = AtomicBitmap::new(len, DEFAULT_PAGE_SIZE);

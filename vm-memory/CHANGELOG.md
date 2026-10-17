@@ -7,9 +7,9 @@
 - \[[#132](https://github.com/rust-vmm/rust-vmm/pull/132)\] Add fast paths for
   guest-memory reads, writes, and range checks that fit within a single memory
   region.
-- The `xen` feature now fails to build with a clear error on every non-Linux
-  target (previously only Windows), since the Xen backend relies on Linux-only
-  ioctls.
+- The `xen` feature now fails to build with a clear error on targets other
+  than Linux and Android (previously only Windows), since the Xen backend
+  relies on Linux ioctls.
 
 ### Fixed
 
