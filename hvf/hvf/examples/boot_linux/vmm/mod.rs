@@ -30,7 +30,7 @@ use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -526,16 +526,24 @@ pub fn run(cfg: Config) -> Result<Outcome> {
         spawn_input(Arc::downgrade(&machine), input)?;
     }
 
-    let order = Arc::new(cpu::CreationOrder::default());
-    let barrier = Arc::new(Barrier::new(cfg.cpus));
+    let gate = Arc::new(cpu::StartGate::new(cfg.cpus));
     let mut threads = Vec::with_capacity(cfg.cpus);
     for index in 0..cfg.cpus {
-        let (machine, order, barrier) = (machine.clone(), order.clone(), barrier.clone());
-        threads.push(
-            thread::Builder::new()
-                .name(format!("vcpu{index}"))
-                .spawn(move || cpu::thread(machine, index, order, barrier))?,
-        );
+        let (m, g) = (machine.clone(), gate.clone());
+        match thread::Builder::new()
+            .name(format!("vcpu{index}"))
+            .spawn(move || cpu::thread(m, index, g))
+        {
+            Ok(t) => threads.push(t),
+            Err(e) => {
+                // Do not return here: the threads already spawned wait at
+                // the gate with their vCPUs, and the VM and its RAM must be
+                // torn down below.
+                machine.fail(format!("cannot spawn the thread of vCPU {index}: {e}"));
+                gate.abort();
+                break;
+            }
+        }
     }
     for (index, t) in threads.into_iter().enumerate() {
         if t.join().is_err() {

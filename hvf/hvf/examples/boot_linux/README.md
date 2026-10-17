@@ -474,6 +474,12 @@ The complete output of a boot with the Rust `/init` on 2 vCPUs
 [boot_linux] guest stopped: Ok(PowerOff)
 ```
 
+The vCPU threads create their vCPUs concurrently, and the framework
+numbers them in creation order, so `id` and the redistributor frame need
+not match the vCPU index. That is fine: Linux finds each CPU's
+redistributor by its affinity (`MPIDR`), and `GICR_TYPER.Last` is always
+on the frame of the highest id.
+
 The end of the initrd depends on the size of the initramfs, and the lines of
 different vCPUs can come in a different order. The first `PSCI` calls are
 the kernel asking for the PSCI version (`0x84000000`), the migration type
