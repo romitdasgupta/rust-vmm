@@ -98,9 +98,10 @@ fn wait(input: &File, stop: &OwnedFd) -> std::io::Result<bool> {
     if fds[0].revents != 0 {
         return Ok(false);
     }
-    if fds[1].revents & libc::POLLNVAL != 0 {
-        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
-    }
+    // `POLLNVAL` on the input is left to `read`: macOS's `poll` does not
+    // support device files and reports `POLLNVAL` for them, `/dev/null`
+    // included, where `read` then sees the end of the input. A closed
+    // file descriptor still fails in `read`, with `EBADF`.
     Ok(true)
 }
 
@@ -266,6 +267,31 @@ mod tests {
         let (rx, tx) = pipe().unwrap();
         let thread = InputThread::spawn(rx, |_| ControlFlow::Break(()), |e| panic!("{e}")).unwrap();
         File::from(tx).write_all(b"x").unwrap();
+        drop(thread);
+    }
+
+    #[test]
+    fn test_dev_null_ends_quietly() {
+        // macOS's `poll` reports `POLLNVAL` for `/dev/null`; the thread
+        // must still end at its EOF without reporting an error.
+        let input = OwnedFd::from(File::open("/dev/null").unwrap());
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let (delivered_tx, delivered_rx) = mpsc::channel::<()>();
+        let mut thread = InputThread::spawn(
+            input,
+            move |_| {
+                let _ = delivered_tx.send(());
+                ControlFlow::Continue(())
+            },
+            move |e| {
+                let _ = closed_tx.send(e.to_string());
+            },
+        )
+        .unwrap();
+        // The thread ends by itself, without delivering or reporting.
+        thread.handle.take().unwrap().join().unwrap();
+        assert_eq!(closed_rx.try_recv().ok(), None);
+        assert!(delivered_rx.try_recv().is_err());
         drop(thread);
     }
 }
