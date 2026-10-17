@@ -52,10 +52,18 @@ fn create_vm() -> Vm {
     Hvf::create_vm(&VmConfig::default()).unwrap()
 }
 
-/// One granule of anonymous memory at each of `ipas`.
-fn guest_memory(vm: &Vm, ipas: &[u64]) -> Mem {
-    let size = vm.ipa_granule() as usize;
-    let ranges: Vec<_> = ipas.iter().map(|&ipa| (GuestAddress(ipa), size)).collect();
+/// Size of each region of [`guest_memory`]: a multiple of every IPA granule.
+const REGION_SIZE: usize = 0x1_0000;
+
+/// [`REGION_SIZE`] bytes of anonymous memory at each of `ipas`.
+///
+/// Create it before the VM, so that it is dropped after it: memory mapped
+/// into a guest must stay alive until it is unmapped or the VM is gone.
+fn guest_memory(ipas: &[u64]) -> Mem {
+    let ranges: Vec<_> = ipas
+        .iter()
+        .map(|&ipa| (GuestAddress(ipa), REGION_SIZE))
+        .collect();
     Mem::from_ranges(&ranges).unwrap()
 }
 
@@ -116,14 +124,14 @@ impl GuestMemoryRegionBytes for NoHostRegion {}
 #[test]
 fn test_map_guest_memory_runs_guest() {
     let Some(_g) = hv_guard() else { return };
+    let mem = guest_memory(&[CODE_IPA, DATA_IPA]);
     let vm = create_vm();
-    let mem = guest_memory(&vm, &[CODE_IPA, DATA_IPA]);
     for (i, insn) in GUEST.iter().enumerate() {
         mem.write_obj(*insn, GuestAddress(CODE_IPA + 4 * i as u64))
             .unwrap();
     }
-    // SAFETY: `mem` outlives the VM, which is dropped at the end of the test,
-    // and is only accessed through `Bytes`.
+    // SAFETY: `mem` was created before the VM, so it outlives it, and it is
+    // only accessed through `Bytes`.
     unsafe { vm.map_guest_memory(&mem, MemoryFlags::RWX).unwrap() };
 
     let mut vcpu = vm.create_vcpu(None).unwrap();
@@ -142,11 +150,10 @@ fn test_map_guest_memory_runs_guest() {
     drop(vcpu);
 
     // Every region is mapped separately and can be unmapped on its own.
-    let size = vm.ipa_granule() as usize;
     for ipa in [CODE_IPA, DATA_IPA] {
-        assert!(!ipa_range_is_free(&vm, ipa, size));
-        vm.unmap(ipa, size).unwrap();
-        assert!(ipa_range_is_free(&vm, ipa, size));
+        assert!(!ipa_range_is_free(&vm, ipa, REGION_SIZE));
+        vm.unmap(ipa, REGION_SIZE).unwrap();
+        assert!(ipa_range_is_free(&vm, ipa, REGION_SIZE));
     }
 }
 
@@ -162,12 +169,14 @@ fn test_map_guest_memory_empty() {
 #[test]
 fn test_map_guest_memory_rollback() {
     let Some(_g) = hv_guard() else { return };
+    let size = REGION_SIZE;
+    // Both are created before the VM, so they outlive it even if the test
+    // fails while they are mapped.
+    let mem = guest_memory(&[CODE_IPA, DATA_IPA]);
+    let blocker = MmapRegion::<()>::new(size).unwrap();
     let vm = create_vm();
-    let size = vm.ipa_granule() as usize;
-    let mem = guest_memory(&vm, &[CODE_IPA, DATA_IPA]);
 
     // Occupy the guest range of the second region.
-    let blocker = MmapRegion::<()>::new(size).unwrap();
     // SAFETY: `blocker` outlives the VM, and the guest never runs.
     unsafe {
         vm.map(blocker.as_ptr(), DATA_IPA, size, MemoryFlags::RW)
